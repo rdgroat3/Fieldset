@@ -1,0 +1,62 @@
+{
+  "expo": {
+    "name": "MEP Survey Pro",
+    "slug": "mep-survey-pro",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "dark",
+    "backgroundColor": "#0D1117",
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.yourcompany.mepsurveypro",
+      "infoPlist": {
+        "NSCameraUsageDescription": "MEP Survey Pro uses the camera to capture tagged survey photos and video walkthroughs.",
+        "NSMicrophoneUsageDescription": "Voice captions use the microphone for dictation.",
+        "NSPhotoLibraryUsageDescription": "Photos are saved to a per-project album in your photo library.",
+        "NSPhotoLibraryAddUsageDescription": "Photos are saved to a per-project album in your photo library.",
+        "NSSpeechRecognitionUsageDescription": "Voice captions use speech recognition to transcribe observations."
+      }
+    },
+    "android": {
+      "package": "com.yourcompany.mepsurveypro",
+      "permissions": [
+        "CAMERA",
+        "RECORD_AUDIO",
+        "READ_MEDIA_IMAGES",
+        "READ_MEDIA_VIDEO",
+        "WRITE_EXTERNAL_STORAGE",
+        "android.permission.CAMERA",
+        "android.permission.RECORD_AUDIO",
+        "android.permission.READ_EXTERNAL_STORAGE",
+        "android.permission.WRITE_EXTERNAL_STORAGE",
+        "android.permission.READ_MEDIA_VISUAL_USER_SELECTED",
+        "android.permission.READ_MEDIA_IMAGES",
+        "android.permission.READ_MEDIA_VIDEO",
+        "android.permission.READ_MEDIA_AUDIO"
+      ]
+    },
+    "plugins": [
+      "expo-camera",
+      "expo-media-library",
+      [
+        "expo-splash-screen",
+        {
+          "backgroundColor": "#0D1117"
+        }
+      ],
+      [
+        "expo-speech-recognition",
+        {
+          "microphonePermission": "Voice captions use the microphone for dictation.",
+          "speechRecognitionPermission": "Voice captions use speech recognition to transcribe observations."
+        }
+      ]
+    ],
+    "sdkVersion": "56.0.0",
+    "extra": {
+      "eas": {
+        "projectId": "04807c1e-25a5-409d-8eb5-7addda54fdd6"
+      }
+    }
+  }
+}
