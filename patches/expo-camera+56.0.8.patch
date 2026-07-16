@@ -1,0 +1,107 @@
+diff --git a/node_modules/expo-camera/android/src/main/java/expo/modules/camera/CameraViewModule.kt b/node_modules/expo-camera/android/src/main/java/expo/modules/camera/CameraViewModule.kt
+index 21382f8..d4a3ec8 100644
+--- a/node_modules/expo-camera/android/src/main/java/expo/modules/camera/CameraViewModule.kt
++++ b/node_modules/expo-camera/android/src/main/java/expo/modules/camera/CameraViewModule.kt
+@@ -306,6 +306,18 @@ class CameraViewModule : Module() {
+         }
+       }
+ 
++      // Fieldset patch: absolute zoom factor, enabling ultra-wide (<1.0x).
++      Prop("zoomRatio") { view, ratio: Float? ->
++        if (view.zoomRatio != ratio) {
++          view.zoomRatio = ratio
++        }
++      }
++
++      // Fieldset patch: report the device's real min/max zoom factors.
++      AsyncFunction("getZoomRange") { view: ExpoCameraView ->
++        view.zoomRange()
++      }
++
+       Prop("mode") { view, mode: CameraMode? ->
+         mode?.let {
+           if (view.cameraMode != it) {
+diff --git a/node_modules/expo-camera/android/src/main/java/expo/modules/camera/ExpoCameraView.kt b/node_modules/expo-camera/android/src/main/java/expo/modules/camera/ExpoCameraView.kt
+index d9690e3..4bce5a4 100644
+--- a/node_modules/expo-camera/android/src/main/java/expo/modules/camera/ExpoCameraView.kt
++++ b/node_modules/expo-camera/android/src/main/java/expo/modules/camera/ExpoCameraView.kt
+@@ -162,6 +162,22 @@ class ExpoCameraView(
+       setCameraZoom(value)
+     }
+ 
++  // Fieldset patch --------------------------------------------------------
++  // Absolute zoom ratio (e.g. 0.5f / 1f / 2f / 5f), clamped to what the
++  // hardware actually reports.
++  //
++  // Upstream only exposes `zoom` as a normalised 0..1 fraction and then does
++  // `max(1f, zoom * maxZoomRatio)` in setCameraZoom() — a hard 1.0x floor.
++  // On phones whose logical back camera bundles an ultra-wide, CameraX reports
++  // minZoomRatio ~0.5 and switches to that lens by itself when you ask for it,
++  // so that floor is the only thing making 0.5x unreachable.
++  var zoomRatio: Float? = null
++    set(value) {
++      field = value
++      value?.let { applyZoomRatio(it) }
++    }
++  // -----------------------------------------------------------------------
++
+   var autoFocus: FocusMode = FocusMode.OFF
+     set(value) {
+       field = value
+@@ -632,6 +648,26 @@ class ExpoCameraView(
+     }
+   }
+ 
++  // Fieldset patch: apply an absolute ratio, clamped to the real hardware
++  // range. Safe on devices with no ultra-wide — minZoomRatio is simply 1.0f
++  // there, so a 0.5f request clamps to 1.0x instead of misbehaving.
++  private fun applyZoomRatio(ratio: Float) {
++    val zoomState = camera?.cameraInfo?.zoomState?.value ?: return
++    camera?.cameraControl?.setZoomRatio(
++      ratio.coerceIn(zoomState.minZoomRatio, zoomState.maxZoomRatio)
++    )
++  }
++
++  // Fieldset patch: lets JS read the true zoom range so the UI can offer only
++  // the factors this device can actually hit, instead of guessing.
++  fun zoomRange(): Map<String, Float> {
++    val zoomState = camera?.cameraInfo?.zoomState?.value
++    return mapOf(
++      "min" to (zoomState?.minZoomRatio ?: 1f),
++      "max" to (zoomState?.maxZoomRatio ?: 1f)
++    )
++  }
++
+   private fun setCameraZoom(value: Float) {
+     val maxZoomRatio = camera?.cameraInfo?.zoomState?.value?.maxZoomRatio ?: 1f
+     val targetZoomRatio = max(1f, min(maxZoomRatio, value.coerceIn(0f, 1f) * maxZoomRatio))
+@@ -644,6 +680,9 @@ class ExpoCameraView(
+         CameraState.Type.OPEN -> {
+           onCameraReady(Unit)
+           setTorchEnabled(enableTorch)
++          // Fieldset patch: the prop can arrive before the camera is bound,
++          // when zoomState is still null and applyZoomRatio() no-ops.
++          zoomRatio?.let { applyZoomRatio(it) }
+         }
+ 
+         else -> {}
+diff --git a/node_modules/expo-camera/build/CameraView.js b/node_modules/expo-camera/build/CameraView.js
+index 78f8198..93a988c 100644
+--- a/node_modules/expo-camera/build/CameraView.js
++++ b/node_modules/expo-camera/build/CameraView.js
+@@ -86,6 +86,15 @@ export default class CameraView extends Component {
+     async getAvailableLensesAsync() {
+         return (await this._cameraRef.current?.getAvailableLenses()) ?? [];
+     }
++    /**
++     * Fieldset patch. Returns the device's true zoom factor range,
++     * e.g. { min: 0.5, max: 10 }. `min` below 1 means an ultra-wide is
++     * reachable via the `zoomRatio` prop. Android only; resolves to
++     * { min: 1, max: 1 } elsewhere.
++     */
++    async getZoomRangeAsync() {
++        return (await this._cameraRef.current?.getZoomRange?.()) ?? { min: 1, max: 1 };
++    }
+     /**
+      * Returns an object with the supported features of the camera on the current device.
+      */

@@ -1,6 +1,7 @@
 import React from 'react';
 import { Text, TouchableOpacity, View, TextInput, StyleSheet } from 'react-native';
-import { C, TAP, FONT } from '../theme';
+import { TAP } from '../theme';
+import { color, radius, font } from '../theme/tokens';
 
 export const Btn = ({ label, onPress, kind = 'primary', style, small }) => (
   <TouchableOpacity
@@ -8,26 +9,26 @@ export const Btn = ({ label, onPress, kind = 'primary', style, small }) => (
     activeOpacity={0.8}
     style={[
       s.btn,
-      kind === 'primary' && { backgroundColor: C.amber },
-      kind === 'ghost' && { backgroundColor: C.panel, borderWidth: 1, borderColor: C.panelEdge },
-      kind === 'danger' && { backgroundColor: C.red },
+      kind === 'primary' && { backgroundColor: color.accent },
+      kind === 'ghost' && { backgroundColor: color.cardFill, borderWidth: 1, borderColor: color.cardBorder },
+      kind === 'danger' && { backgroundColor: '#e5484d' },
       small && { minHeight: 40, paddingHorizontal: 14 },
       style,
     ]}
   >
-    <Text style={[s.btnText, kind === 'primary' ? { color: C.amberInk } : { color: C.ink }, small && { fontSize: 13 }]}>
+    <Text style={[s.btnText, kind === 'primary' ? { color: color.ink } : { color: color.textPrimary }, small && { fontSize: 13 }]}>
       {label}
     </Text>
   </TouchableOpacity>
 );
 
-export const Chip = ({ label, active, onPress, color = C.amber }) => (
+export const Chip = ({ label, active, onPress, color: activeColor = color.accent }) => (
   <TouchableOpacity
     onPress={onPress}
     activeOpacity={0.8}
-    style={[s.chip, active && { backgroundColor: color, borderColor: color }]}
+    style={[s.chip, active && { backgroundColor: activeColor, borderColor: activeColor }]}
   >
-    <Text style={[s.chipText, active && { color: C.amberInk }]}>{label}</Text>
+    <Text style={[s.chipText, active && { color: color.ink }]}>{label}</Text>
   </TouchableOpacity>
 );
 
@@ -39,7 +40,7 @@ export const Field = ({ label, value, onChangeText, placeholder, keyboardType, a
       value={value}
       onChangeText={onChangeText}
       placeholder={placeholder}
-      placeholderTextColor={C.inkDim}
+      placeholderTextColor={color.text30}
       keyboardType={keyboardType}
       autoCapitalize={autoCapitalize}
     />
@@ -51,34 +52,34 @@ export const SectionLabel = ({ children }) => <Text style={s.section}>{children}
 const s = StyleSheet.create({
   btn: {
     minHeight: TAP,
-    borderRadius: 10,
+    borderRadius: radius.button,
     alignItems: 'center',
     justifyContent: 'center',
     paddingHorizontal: 20,
   },
-  btnText: { ...FONT.display, fontSize: 15 },
+  btnText: { ...font(700, 15) },
   chip: {
     paddingHorizontal: 14,
     minHeight: 42,
     justifyContent: 'center',
-    borderRadius: 8,
+    borderRadius: radius.spaceCard,
     borderWidth: 1,
-    borderColor: C.panelEdge,
-    backgroundColor: C.panel,
+    borderColor: color.cardBorder,
+    backgroundColor: color.cardFill,
     marginRight: 8,
     marginBottom: 8,
   },
-  chipText: { color: C.ink, fontWeight: '700', fontSize: 13 },
-  fieldLabel: { ...FONT.label, color: C.inkDim, marginBottom: 6 },
+  chipText: { ...font(700, 13), color: color.textPrimary },
+  fieldLabel: { ...font(700, 11, { mono: true, ls: 0.8 }), color: color.text45, marginBottom: 6 },
   input: {
-    backgroundColor: C.panel,
+    backgroundColor: color.cardFill,
     borderWidth: 1,
-    borderColor: C.panelEdge,
-    borderRadius: 10,
-    color: C.ink,
+    borderColor: color.cardBorder,
+    borderRadius: radius.button,
+    color: color.textPrimary,
     paddingHorizontal: 14,
     minHeight: TAP,
     fontSize: 16,
   },
-  section: { ...FONT.label, color: C.amber, marginTop: 18, marginBottom: 8 },
+  section: { ...font(700, 11, { mono: true, ls: 0.8 }), color: color.accent, marginTop: 18, marginBottom: 8 },
 });

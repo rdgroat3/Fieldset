@@ -5,6 +5,7 @@
 
 import * as FileSystem from 'expo-file-system/legacy';
 import * as MediaLibrary from 'expo-media-library';
+import * as Sharing from 'expo-sharing';
 
 const DIR = FileSystem.documentDirectory + 'surveys/';
 
@@ -19,6 +20,18 @@ export async function persistToApp(tempUri, ext = 'jpg') {
   const dest = `${DIR}${Date.now()}_${Math.random().toString(36).slice(2, 7)}.${ext}`;
   await FileSystem.copyAsync({ from: tempUri, to: dest });
   return dest;
+}
+
+// Non-prompting status check — lets a screen show a persistent "photos
+// aren't backing up to your camera roll" banner without interrupting
+// capture flow with a permission prompt on every single shot.
+export async function getMediaLibraryPermissionStatus() {
+  try {
+    const { status, canAskAgain } = await MediaLibrary.getPermissionsAsync();
+    return { granted: status === 'granted', canAskAgain };
+  } catch (e) {
+    return { granted: false, canAskAgain: true };
+  }
 }
 
 // Save into the user's photo library under a per-project album.
@@ -36,7 +49,12 @@ export async function saveToProjectAlbum(uri, albumName) {
     }
     return asset.id;
   } catch (e) {
-    return null; // never lose a capture because album save failed
+    // Never lose a capture because the album save failed — the app copy from
+    // persistToApp() already has it. But log it: a silently-swallowed
+    // failure here means "photos aren't backing up" goes unnoticed for an
+    // entire survey.
+    console.warn('[media] saveToProjectAlbum failed:', e);
+    return null;
   }
 }
 
@@ -56,4 +74,25 @@ export async function sweepAssets(assetIds) {
 
 export async function deleteAppFile(uri) {
   try { await FileSystem.deleteAsync(uri, { idempotent: true }); } catch (e) {}
+}
+
+// Opens the OS share sheet for one file so the user can pick Google Photos.
+// expo-sharing only supports a single file per call (Android has no public
+// Expo API for a true multi-select ACTION_SEND_MULTIPLE without adding a
+// native module + full eas build), so batches are driven as a sequential
+// loop by the caller, one share-sheet prompt per item.
+export async function shareToGooglePhotos(uri) {
+  const available = await Sharing.isAvailableAsync();
+  if (!available) throw new Error('Sharing is not available on this device.');
+  const mimeType = uri.endsWith('.mp4') ? 'video/mp4' : 'image/jpeg';
+  await Sharing.shareAsync(uri, { mimeType, dialogTitle: 'Save to Google Photos' });
+}
+
+// Hand a video to the device's own player via the share sheet. The app has
+// no in-app video player (adding one is a native dep + full build), so this
+// is the JS-only pathway for reviewing walkthrough clips.
+export async function openVideoExternally(uri) {
+  const available = await Sharing.isAvailableAsync();
+  if (!available) throw new Error('Sharing is not available on this device.');
+  await Sharing.shareAsync(uri, { mimeType: 'video/mp4', dialogTitle: 'Open video with…' });
 }

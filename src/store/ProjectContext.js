@@ -85,6 +85,10 @@ export function ProjectProvider({ children }) {
     ));
   }, [projects, persist]);
 
+  // Nameplate data lives on photo.nameplate (set by CameraScreen or Decoder,
+  // both saving through addPhoto). No separate equipment store — see
+  // DecoderScreen and EquipmentScreen for why.
+
   const addPanel = useCallback((projectId, panel) => {
     const id = uid();
     persist(projects.map((p) =>

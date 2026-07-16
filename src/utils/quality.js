@@ -52,7 +52,10 @@ export async function checkPhotoQuality(uri, { nameplate = false } = {}) {
       meanLuma: Math.round(meanLuma),
     };
   } catch (e) {
-    // Never block a save because the checker failed — degrade gracefully.
+    // Never block a save because the checker failed — degrade gracefully,
+    // but log it: a silently-swallowed exception here would always report
+    // "not blurry" regardless of the actual photo.
+    console.warn('[quality] blur/exposure check failed:', e);
     return { ok: true, blurry: false, dark: false, variance: -1, meanLuma: -1, error: String(e) };
   }
 }

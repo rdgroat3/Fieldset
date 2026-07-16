@@ -1,26 +1,7 @@
-// Design system: "instrument panel" aesthetic.
-// High contrast for dark mechanical rooms + gloved thumbs.
-// Safety-amber accent borrowed from electrical panel warning labels.
-
-export const C = {
-  bg: '#0D1117',        // graphite black
-  panel: '#161C24',     // raised panel surface
-  panelEdge: '#232B36', // hairline edges
-  ink: '#E8EDF2',       // primary text
-  inkDim: '#8B97A5',    // secondary text
-  amber: '#FFB020',     // primary action / accent (safety amber)
-  amberInk: '#1A1200',  // text on amber
-  green: '#3FD68C',     // pass / OK
-  red: '#FF5A52',       // fail / deficiency
-  blue: '#4DA3FF',      // info / nameplate mode
-};
-
-export const FONT = {
-  // System fonts keep the bundle light; weights carry the identity.
-  display: { fontWeight: '800', letterSpacing: 0.5 },
-  label: { fontWeight: '700', letterSpacing: 1.2, textTransform: 'uppercase', fontSize: 11 },
-  mono: { fontVariant: ['tabular-nums'] },
-};
+// Non-visual survey constants. The old amber C/FONT design system that used
+// to live here has been fully retired — every screen now uses the cobalt
+// tokens in src/theme/tokens.js. What's left are real, still-used data
+// constants that aren't part of any visual theme.
 
 // Big-target sizing: everything tappable is >= 52pt for gloved hands.
 export const TAP = 52;
