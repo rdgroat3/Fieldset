@@ -96,6 +96,13 @@ export default function CameraScreen({ navigation, route }) {
   // prop plus getZoomRangeAsync(), so these are measured, not guessed.
   const [zoomRatio, setZoomRatio] = useState(1);
   const [zoomRange, setZoomRange] = useState({ min: 1, max: 1 });
+  // Whether the running BINARY actually has the patch compiled in. The probe
+  // below is defensive (optional chaining + try/catch), but the `zoomRatio`
+  // PROP was not: it was handed to CameraView unconditionally, so on a build
+  // where the patch didn't apply, JS sets a prop the native view never
+  // declared. Treat the prop as opt-in, proven by a successful probe, rather
+  // than assumed. Starts null = unknown, so nothing is passed until proven.
+  const [zoomSupported, setZoomSupported] = useState(null);
   const zoomRef = useRef(1);
   const pinchStartZoom = useSharedValue(1);
   const [ultraWide, setUltraWide] = useState(null); // iOS lens id, if any
@@ -151,8 +158,15 @@ export default function CameraScreen({ navigation, route }) {
         const r = await cam.current?.getZoomRangeAsync?.();
         if (alive && r && Number.isFinite(r.min) && Number.isFinite(r.max)) {
           setZoomRange({ min: r.min, max: r.max });
+          setZoomSupported(true);
+        } else if (alive) {
+          // Method missing or returned nothing => unpatched binary.
+          setZoomSupported(false);
         }
-      } catch (e) { /* unpatched build — presets fall back to 1x+ */ }
+      } catch (e) {
+        // unpatched build - presets fall back to 1x+ and the prop stays off
+        if (alive) setZoomSupported(false);
+      }
     })();
     return () => { alive = false; };
   }, [isFocused]);
@@ -533,7 +547,7 @@ export default function CameraScreen({ navigation, route }) {
           style={StyleSheet.absoluteFill}
           facing="back"
           mode={camMode}
-          zoomRatio={zoomRatio}
+          {...(zoomSupported ? { zoomRatio } : null)}
           selectedLens={lensOverride || undefined}
           enableTorch={torchOn}
           // 'off' means "autofocus continuously as needed" per expo-camera;
