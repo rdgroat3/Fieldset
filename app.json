@@ -1,16 +1,23 @@
 {
   "expo": {
-    "name": "MEP Survey Pro",
+    "name": "Fieldset",
     "slug": "mep-survey-pro",
     "version": "1.0.0",
     "orientation": "portrait",
     "userInterfaceStyle": "dark",
     "backgroundColor": "#0D1117",
+    "icon": "./icon.png",
+    "splash": {
+      "image": "./icon.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#0D1117"
+    },
     "ios": {
       "supportsTablet": true,
       "bundleIdentifier": "com.yourcompany.mepsurveypro",
+      "icon": "./icon-ios.png",
       "infoPlist": {
-        "NSCameraUsageDescription": "MEP Survey Pro uses the camera to capture tagged survey photos and video walkthroughs.",
+        "NSCameraUsageDescription": "Fieldset uses the camera to capture tagged survey photos and video walkthroughs.",
         "NSMicrophoneUsageDescription": "Voice captions use the microphone for dictation.",
         "NSPhotoLibraryUsageDescription": "Photos are saved to a per-project album in your photo library.",
         "NSPhotoLibraryAddUsageDescription": "Photos are saved to a per-project album in your photo library.",
@@ -39,24 +46,24 @@
       "expo-camera",
       "expo-media-library",
       [
-        "expo-splash-screen",
-        {
-          "backgroundColor": "#0D1117"
-        }
-      ],
-      [
         "expo-speech-recognition",
         {
           "microphonePermission": "Voice captions use the microphone for dictation.",
           "speechRecognitionPermission": "Voice captions use speech recognition to transcribe observations."
         }
-      ]
+      ],
+      "expo-font"
     ],
-    "sdkVersion": "56.0.0",
     "extra": {
       "eas": {
         "projectId": "04807c1e-25a5-409d-8eb5-7addda54fdd6"
       }
+    },
+    "runtimeVersion": {
+      "policy": "appVersion"
+    },
+    "updates": {
+      "url": "https://u.expo.dev/04807c1e-25a5-409d-8eb5-7addda54fdd6"
     }
   }
 }

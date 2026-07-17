@@ -19,6 +19,11 @@ import { checkPhotoQuality } from '../utils/quality';
 
 const pad2 = (n) => String(n).padStart(2, '0');
 
+// Standard floor level presets: basement levels (B1, B2), ground through roof,
+// penthouse, etc. Provides sensible defaults for the level picker when the
+// surveyor hasn't custom-added levels yet.
+const COMMON_LEVELS = ['B2', 'B1', '01', '02', '03', '04', '05', '06', '07', '08', '09', '10', '11', '12', 'P', 'RF'];
+
 /**
  * Capture screen. Photos save directly to the project (no per-shot Review
  * detour) so a walkthrough stays fast:
