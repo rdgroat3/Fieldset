@@ -1,10 +1,12 @@
 import React, { useRef, useState, useMemo } from 'react';
 import {
   View, Text, StyleSheet, Pressable, Image, Modal, FlatList, TextInput, Alert, Linking,
+  useWindowDimensions, Platform,
 } from 'react-native';
 import { CameraView, useCameraPermissions, useMicrophonePermissions } from 'expo-camera';
 import { LinearGradient } from 'expo-linear-gradient';
 import ViewShot, { captureRef } from 'react-native-view-shot';
+import Svg, { Rect } from 'react-native-svg';
 import { Gesture, GestureDetector } from 'react-native-gesture-handler';
 import Animated, { useAnimatedStyle, useSharedValue, withTiming, runOnJS } from 'react-native-reanimated';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
@@ -12,17 +14,31 @@ import { useFocusEffect, useIsFocused } from '@react-navigation/native';
 import HoldShutter, { PHOTO_OPTIONS, VIDEO_OPTIONS } from '../components/HoldShutter';
 import { MinusIcon, PlusIcon, LabelsToggleIcon, FlagIcon, TorchIcon } from '../components/Icons';
 import { color, radius, font, gradient, angle } from '../theme/tokens';
-import { SYSTEMS } from '../theme';
 import { useProjects } from '../store/ProjectContext';
 import { persistToApp, saveToProjectAlbum, deleteAppFile, sweepAssets, getMediaLibraryPermissionStatus } from '../utils/media';
 import { checkPhotoQuality } from '../utils/quality';
 
 const pad2 = (n) => String(n).padStart(2, '0');
 
-// Standard floor level presets: basement levels (B1, B2), ground through roof,
-// penthouse, etc. Provides sensible defaults for the level picker when the
-// surveyor hasn't custom-added levels yet.
-const COMMON_LEVELS = ['B2', 'B1', '01', '02', '03', '04', '05', '06', '07', '08', '09', '10', '11', '12', 'P', 'RF'];
+// Width in px of each edge bar drawn around the screen while flagging is on.
+// This was referenced by the flag-frame render below but never defined,
+// which threw a ReferenceError the instant the flag toggle was switched
+// on — that was the "clicking the flag crashes the app" bug.
+// Height of the Floor/Room toolbar row (matches the pill's minHeight) — used
+// to position the recording timer below it instead of overlapping.
+const TOOLBAR_ROW_H = 38;
+
+const FLAG_BAR = 6;
+
+// Stock expo-camera's `zoom` is a 0..1 fraction with no way to ask what the
+// real maximum factor is. Assume a typical ~8x logical-camera max so presets
+// map to something sane on unpatched builds. Module scope: updateZoom()
+// references it, and a const declared later in the component body would sit in
+// the temporal dead zone.
+const ASSUMED_MAX_FACTOR = 8;
+
+// Floor level presets, fixed to the surveyor's actual level set.
+const COMMON_LEVELS = ['B1', '01', '02', '03', '04', 'RF', 'EXT'];
 
 /**
  * Capture screen. Photos save directly to the project (no per-shot Review
@@ -40,6 +56,9 @@ const COMMON_LEVELS = ['B2', 'B1', '01', '02', '03', '04', '05', '06', '07', '08
  */
 export default function CameraScreen({ navigation, route }) {
   const insets = useSafeAreaInsets();
+  // Real screen size for the SVG flag frame below — it needs concrete pixel
+  // dimensions, not percentages, to draw one continuous stroked rect.
+  const { width: winW, height: winH } = useWindowDimensions();
   const { projectId } = route.params || {};
   const { projects, addPhoto, updateProject, deletePhoto, settings } = useProjects();
   const project = projects.find((p) => p.id === projectId);
@@ -53,14 +72,16 @@ export default function CameraScreen({ navigation, route }) {
   const [level, setLevel] = useState(last?.level || project?.levels?.[0] || '01');
   const [spaceType, setSpaceType] = useState(last?.space || project?.spaceTypes?.[0] || 'Space');
   const [spaceNum, setSpaceNum] = useState(last?.spaceNum || 1);
-  // Systems are MULTI-SELECT. Most survey photos are general or cover more
-  // than one discipline; forcing exactly one tag (and silently defaulting to
-  // MECH) mislabels the majority of shots. Empty = GENERAL.
+  // Systems are MULTI-SELECT and default to GENERAL. Every photo is saved
+  // tagged 'GEN' rather than untagged, so nothing ever lands in the survey
+  // with no discipline at all; the surveyor changes it (add MECH, drop GEN,
+  // whatever) during the Finalize review pass. GEN is a real, removable tag
+  // here — not a placeholder — so it toggles like any other.
   // `system` is still saved as a derived STRING ('MECH+ELEC' / 'GEN') so the
   // gallery, CSV and report code keep working unchanged, while `systems`
   // carries the structured truth.
   const [systems, setSystems] = useState(
-    Array.isArray(last?.systems) ? last.systems : []
+    Array.isArray(last?.systems) && last.systems.length ? last.systems : ['GEN']
   );
   const system = systems.length ? systems.join('+') : 'GEN';
 
@@ -113,6 +134,20 @@ export default function CameraScreen({ navigation, route }) {
   const [ultraWide, setUltraWide] = useState(null); // iOS lens id, if any
   const [lensOverride, setLensOverride] = useState(null);
 
+  // Android PHYSICAL ultra-wide (Pixel-class devices). Pixels don't fuse the
+  // ultra-wide into the logical back camera's zoom range for third-party
+  // apps — zoomState reports min 1.0 even though the lens is right there —
+  // so sub-1.0 zoomRatio can never reach it. The extended expo-camera patch
+  // adds getUltraWideInfo() (is there a separate back camera with intrinsic
+  // zoom < 1?) and an `ultraWide` prop that rebinds CameraX to that physical
+  // camera directly. These track that path:
+  //   uwInfo — probe result { available, intrinsicZoom } once known
+  //   uwCam  — currently bound to the physical ultra-wide
+  const [uwInfo, setUwInfo] = useState(null);
+  const [uwCam, setUwCam] = useState(false);
+  const uwInfoRef = useRef(null);
+  const uwCamRef = useRef(false);
+
   // Freeze-frame + burn-in state: while a photo is being composited we hold
   // the raw shot here so ViewShot can capture image+watermark together.
   const [pendingUri, setPendingUri] = useState(null);
@@ -145,36 +180,92 @@ export default function CameraScreen({ navigation, route }) {
   // preview whenever the screen isn't focused makes it reacquire cleanly.
   const isFocused = useIsFocused();
 
-  // Ask the OS which physical lenses exist. iOS-only in expo-camera; resolves
-  // to [] on Android, which is exactly why 0.5x can't be offered there.
+  // isFocused flips true the instant navigation lands back on this screen,
+  // but the OUTGOING screen's native camera session (e.g. Decoder's
+  // CameraView) hasn't necessarily finished releasing yet — React unmount
+  // and the native camera teardown aren't synchronized. Mounting this
+  // screen's CameraView immediately raced that teardown and lost: the
+  // acquire silently failed, onCameraReady never fired, and the preview
+  // came back dead with no visible error. Stagger the remount by one beat
+  // so the previous session has time to actually let go first.
+  const [camMounted, setCamMounted] = useState(true);
+  React.useEffect(() => {
+    if (!isFocused) {
+      setCamMounted(false);
+      return undefined;
+    }
+    const t = setTimeout(() => setCamMounted(true), 120);
+    return () => clearTimeout(t);
+  }, [isFocused]);
+
+  // Verified against the installed expo-camera native source (both platforms
+  // read directly, not assumed):
+  //
+  // - getAvailableLensesAsync / selectedLens: real, iOS-only (there's no
+  //   Android Kotlin Prop("selectedLens") at all). Apple's localized device
+  //   name is "Back Ultra Wide Camera" — TWO words with a space. The old
+  //   /ultrawide/i regex required them contiguous and never matched a real
+  //   device, silently disabling 0.5x on every iPhone that has one.
+  //
+  // - getZoomRangeAsync / zoomRatio: a patch on top of CameraX's zoomState,
+  //   and genuinely Android-only — there's no Swift Prop("zoomRatio")
+  //   anywhere in the package. On iOS the JS wrapper still resolves (it
+  //   always ??s to { min: 1, max: 1 } when the native method is absent),
+  //   so the old code's "did it resolve to something finite?" check read
+  //   that placeholder as a real measurement, flipped zoomSupported to true
+  //   on EVERY iPhone, and then handed CameraView a zoomRatio prop iOS
+  //   silently ignores — 2x/5x wouldn't actually move the lens at all.
+  //   Branching on Platform.OS directly (documented capability, not
+  //   inferred from a value that's ambiguous by construction) removes that
+  //   whole failure mode.
   React.useEffect(() => {
     let alive = true;
     (async () => {
-      try {
-        const lenses = await cam.current?.getAvailableLensesAsync?.();
-        if (alive && Array.isArray(lenses)) {
-          const uw = lenses.find((l) => /ultrawide/i.test(l));
-          if (uw) setUltraWide(uw);
+      if (Platform.OS === 'ios') {
+        try {
+          const lenses = await cam.current?.getAvailableLensesAsync?.();
+          if (alive && Array.isArray(lenses)) {
+            const uw = lenses.find((l) => /ultra\s*-?\s*wide/i.test(l));
+            if (uw) setUltraWide(uw);
+          }
+        } catch (e) { /* device has no ultra-wide, or no lens API */ }
+      }
+      if (Platform.OS === 'android') {
+        // The camera binds asynchronously after mount; before it does,
+        // zoomState is null and getZoomRange returns the {1,1} placeholder —
+        // which used to get recorded as "no zoom on this device" forever if
+        // the probe won the race. Retry a few beats instead of measuring
+        // once against an unbound camera.
+        for (let attempt = 0; attempt < 8 && alive; attempt++) {
+          try {
+            const r = await cam.current?.getZoomRangeAsync?.();
+            if (r && Number.isFinite(r.min) && Number.isFinite(r.max) && r.max > r.min) {
+              if (!alive) return;
+              setZoomRange({ min: r.min, max: r.max });
+              setZoomSupported(true);
+              // Fused ultra-wide (min < 1) needs nothing more. Otherwise ask
+              // whether a SEPARATE physical ultra-wide camera exists (Pixel).
+              if (r.min >= 1) {
+                try {
+                  const uw = await cam.current?.getUltraWideInfoAsync?.();
+                  if (alive && uw?.available) {
+                    uwInfoRef.current = uw;
+                    setUwInfo(uw);
+                  }
+                } catch (e) { /* patch predates getUltraWideInfo — fine */ }
+              }
+              return;
+            }
+          } catch (e) { /* not bound yet, or unpatched — fall through to retry */ }
+          await new Promise((res) => setTimeout(res, 250));
         }
-      } catch (e) { /* iOS-only API */ }
-      try {
-        // Patched into expo-camera. Gives the device's real factors, e.g.
-        // { min: 0.5, max: 10 } on a phone with an ultra-wide.
-        const r = await cam.current?.getZoomRangeAsync?.();
-        if (alive && r && Number.isFinite(r.min) && Number.isFinite(r.max)) {
-          setZoomRange({ min: r.min, max: r.max });
-          setZoomSupported(true);
-        } else if (alive) {
-          // Method missing or returned nothing => unpatched binary.
-          setZoomSupported(false);
-        }
-      } catch (e) {
-        // unpatched build - presets fall back to 1x+ and the prop stays off
         if (alive) setZoomSupported(false);
+      } else if (alive) {
+        setZoomSupported(false);
       }
     })();
     return () => { alive = false; };
-  }, [isFocused]);
+  }, [camMounted]);
 
   // Recording timer, so it's obvious capture is actually running.
   React.useEffect(() => {
@@ -236,10 +327,9 @@ export default function CameraScreen({ navigation, route }) {
     setLevelPicker(false);
   };
 
-  // Toggle a discipline on/off. No selection at all is a valid, meaningful
-  // state (a general shot) — it saves as 'GEN'.
-  const toggleSystem = (id) =>
-    setSystems((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]));
+  // Systems are now tagged on the Finalize review screen, not here — see
+  // FinalizeScreen.js. Photos still save with an empty systems[] at capture
+  // time and pick up tags during review.
 
   const addNewLevel = () => {
     const val = newLevelInput.trim();
@@ -279,6 +369,32 @@ export default function CameraScreen({ navigation, route }) {
   };
 
   /**
+   * Non-blocking "this looks blurry" prompt, shared by both the watermarked
+   * and raw-save paths. Honors Settings > Warn on blurry shots, so a surveyor
+   * shooting fast in a dark plenum isn't fighting a popup every frame.
+   */
+  const maybeWarnBlurry = (quality, photoId, appUri, assetId) => {
+    if (!quality?.blurry) return;
+    if (settings?.blurCheck === false) return;
+    Alert.alert(
+      'Blurry shot',
+      'This photo looks blurry. Keep it, or retake?',
+      [
+        { text: 'Keep', style: 'cancel' },
+        {
+          text: 'Retake',
+          style: 'destructive',
+          onPress: () => {
+            const saved = project?.photos?.find((p) => p.id === photoId)
+              || { id: photoId, uri: appUri, assetId };
+            removePhoto(saved);
+          },
+        },
+      ]
+    );
+  };
+
+  /**
    * Take, burn watermark, persist, addPhoto - all inline, no Review screen.
    * After saving, run the blur check; if blurry, offer Keep / Retake.
    */
@@ -286,7 +402,38 @@ export default function CameraScreen({ navigation, route }) {
     if (busy || recording || !cam.current) return;
     setBusy(true);
     try {
-      const photo = await cam.current.takePictureAsync({ quality: 0.9 });
+      // Full-quality capture by default. `quality` here is JPEG compression on
+      // the FULL-RESOLUTION sensor image, so there's no reason to spend
+      // sharpness at capture time — the file is transient and re-encoded below
+      // anyway. Configurable via Settings > Capture Quality.
+      const q = typeof settings?.photoQuality === 'number' ? settings.photoQuality : 1;
+      const photo = await cam.current.takePictureAsync({ quality: q });
+
+      // Watermark off -> keep the ORIGINAL file untouched. The burn path below
+      // captures an on-screen composite, which is inherently limited to the
+      // preview's pixel dimensions — that downscale (not the JPEG quality
+      // number) is what made saved photos look soft next to the live preview.
+      // Skipping it entirely is the only way to keep true sensor resolution.
+      // Three ways to land here: the Settings toggle, the on-screen labels
+      // toggle, or simply nothing to draw.
+      const burnOff = settings?.burnWatermark === false;
+      if (burnOff || (!labelsOn && !flagOn)) {
+        const appUri = await persistToApp(photo.uri, 'jpg');
+        const assetId = await saveToProjectAlbum(appUri, project.name);
+        const quality = await checkPhotoQuality(photo.uri);
+        const photoId = addPhoto(projectId, {
+          uri: appUri, assetId,
+          level, space: spaceType, spaceNum, system, systems,
+          // Still recorded as flagged even with no burned-in banner — the
+          // stamp is a convenience for reading the JPEG standalone, not the
+          // source of truth. Gallery, exports and the report all read this.
+          flagged: flagOn, caption: '',
+          type: 'photo', mode: 'photo', quality, nameplate: null,
+        });
+        maybeWarnBlurry(quality, photoId, appUri, assetId);
+        return;
+      }
+
       // Show the shot in a VISIBLE full-screen composite so ViewShot can
       // actually paint and capture it. Off-screen (-10000) views don't reliably
       // render on Android, which produced black captures. The brief freeze-frame
@@ -297,30 +444,42 @@ export default function CameraScreen({ navigation, route }) {
       // painting before capturing — a fixed frame-count wait let ViewShot
       // fire before the image had visibly painted on slower devices, which
       // silently fell back to saving the RAW (unwatermarked) photo below.
+      // Safety net bumped 400ms -> 700ms: on a cold-started camera screen
+      // (first shot after opening Capture), onLoadEnd can lag noticeably
+      // behind a fast tap-to-shoot, and this is a one-time cost per photo,
+      // not per frame, so the extra margin is cheap insurance.
       await new Promise((resolve) => {
         imageReadyResolve.current = resolve;
-        setTimeout(resolve, 400); // safety net if onLoadEnd never fires
+        setTimeout(resolve, 700);
       });
       await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
 
+      // quality: 1 — this composite is already downscaled to preview
+      // dimensions, so compressing it again on top of that was stacking two
+      // separate quality losses. Cheap to keep this step lossless.
+      const burnOpts = { format: 'jpg', quality: 1 };
       let appUri;
-      try {
-        appUri = await persistToApp(
-          await captureRef(shotRef, { format: 'jpg', quality: 0.92 }),
-          'jpg'
-        );
-      } catch (e1) {
-        // One retry after a short beat before giving up on the burn — most
-        // failures here are timing, not permanent.
+      let stampFailed = false;
+      // Three attempts, back-loaded with delay, before giving up — most
+      // failures here are timing (the composite genuinely hadn't painted
+      // yet), not permanent, so a beat between tries has a real chance of
+      // succeeding where an immediate retry wouldn't.
+      for (let attempt = 0; attempt < 3 && !appUri; attempt++) {
+        if (attempt > 0) await new Promise((r) => setTimeout(r, 200 * attempt));
         try {
-          await new Promise((r) => setTimeout(r, 150));
-          appUri = await persistToApp(
-            await captureRef(shotRef, { format: 'jpg', quality: 0.92 }),
-            'jpg'
-          );
-        } catch (e2) {
-          console.warn('[CameraScreen] watermark burn failed twice, saving raw photo:', e2);
-          appUri = await persistToApp(photo.uri, 'jpg');
+          appUri = await persistToApp(await captureRef(shotRef, burnOpts), 'jpg');
+        } catch (e) {
+          if (attempt === 2) {
+            // All three tries failed. Falling back to the raw file keeps the
+            // photo — losing it entirely would be worse — but a flagged
+            // photo with no visible stamp is exactly the kind of gap a field
+            // survey can't afford to discover later. `stampFailed` surfaces
+            // it as a small badge in Gallery/Finalize instead of only a
+            // console.warn no one in the field will ever see.
+            console.warn('[CameraScreen] watermark burn failed 3x, saving raw photo:', e);
+            appUri = await persistToApp(photo.uri, 'jpg');
+            stampFailed = true;
+          }
         }
       }
       const assetId = await saveToProjectAlbum(appUri, project.name);
@@ -328,29 +487,17 @@ export default function CameraScreen({ navigation, route }) {
       const photoId = addPhoto(projectId, {
         uri: appUri, assetId,
         level, space: spaceType, spaceNum, system, systems,
-        flagged: flagOn, caption: '',
+        flagged: flagOn, caption: '', stampFailed,
         type: 'photo', mode: 'photo', quality, nameplate: null,
       });
       setPendingUri(null);
-
-      if (quality?.blurry) {
+      if (stampFailed) {
         Alert.alert(
-          'Blurry shot',
-          'This photo looks blurry. Keep it, or retake?',
-          [
-            { text: 'Keep', style: 'cancel' },
-            {
-              text: 'Retake',
-              style: 'destructive',
-              onPress: () => {
-                const saved = project?.photos?.find((p) => p.id === photoId)
-                  || { id: photoId, uri: appUri, assetId };
-                removePhoto(saved);
-              },
-            },
-          ]
+          'Stamp didn\u2019t save',
+          'This photo saved, but the watermark/flag banner failed to burn in after 3 tries. The flag is still recorded in the app \u2014 just not visible if you export or share this file directly.'
         );
       }
+      maybeWarnBlurry(quality, photoId, appUri, assetId);
     } catch (e) {
       // Even the raw-photo fallback threw — most commonly the device is out
       // of storage. Never let this fail silently: the whole point of a
@@ -490,7 +637,33 @@ export default function CameraScreen({ navigation, route }) {
 
   // Clamp + commit an absolute zoom factor.
   const updateZoom = (r) => {
-    const clamped = Math.max(zoomRange.min, Math.min(zoomRange.max, r));
+    // zoomRange only carries real hardware limits once the patched probe has
+    // resolved. Before that (and forever, on an unpatched binary) it stays at
+    // the {min:1,max:1} placeholder — clamping to it would pin EVERY preset to
+    // 1x, which is the second half of why the zoom buttons did nothing. Only
+    // clamp to a range that was actually measured.
+    const measured = zoomSupported === true && zoomRange.max > zoomRange.min;
+    // A physical ultra-wide (Pixel path) extends the reachable floor below
+    // the logical camera's measured min — its own intrinsic factor is the
+    // true bottom of the scale.
+    const uwFloor = uwInfoRef.current?.available
+      ? (Math.round((uwInfoRef.current.intrinsicZoom || 0.5) * 10) / 10)
+      : null;
+    let lo = measured ? zoomRange.min : (ultraWide ? 0.5 : 1);
+    if (uwFloor != null) lo = Math.min(lo, uwFloor);
+    const hi = measured ? zoomRange.max : ASSUMED_MAX_FACTOR;
+    const clamped = Math.max(lo, Math.min(hi, r));
+    // Crossing 1x on the physical-ultra-wide path means switching which
+    // camera is bound, not just changing a ratio. Driven here (rather than
+    // only from the preset buttons) so a pinch that crosses the line also
+    // switches lenses, like the stock camera app.
+    if (uwFloor != null) {
+      const wantUw = clamped < 0.97;
+      if (wantUw !== uwCamRef.current) {
+        uwCamRef.current = wantUw;
+        setUwCam(wantUw);
+      }
+    }
     zoomRef.current = clamped;
     setZoomRatio(clamped);
   };
@@ -502,17 +675,67 @@ export default function CameraScreen({ navigation, route }) {
       runOnJS(updateZoom)(pinchStartZoom.value * e.scale);
     });
 
-  // Presets, native-camera style. Only offer what the hardware reports it can
-  // actually do — .5 appears solely when minZoomRatio really is sub-1x.
-  const ZOOM_PRESETS = [0.5, 1, 2, 5].filter(
-    (r) => r >= zoomRange.min - 0.001 && r <= zoomRange.max + 0.001
-  );
+  // Presets, native-camera style.
+  //
+  // Two entirely separate mechanisms reach the ultra-wide, per platform (see
+  // the capability effect above for what's actually verified in the native
+  // source):
+  //   iOS:     `ultraWide` — a real physical lens, switched via selectedLens.
+  //            Always offered as "0.5" once detected; the lens itself defines
+  //            what its own 0-zoom field of view is.
+  //   Android: `zoomRange.min` — expo-camera has NO lens-switching API here,
+  //            so this only works if CameraX itself fuses the ultra-wide into
+  //            one continuous zoom range AND this device's camera reports a
+  //            minZoomRatio below 1. Many Android phones don't and report
+  //            min:1 even with an ultra-wide lens physically present — in
+  //            that case there's no button to show; expo-camera has no way to
+  //            reach it, full stop, short of a custom native module.
+  // When Android IS reachable, the button shows the device's actual measured
+  // minimum (rounded to 1 decimal) rather than an assumed "0.5" — hardcoding
+  // 0.5 would clamp to whatever the real floor is anyway, silently landing
+  // short of what the label promised.
+  const androidWideMin = (Platform.OS === 'android' && zoomSupported === true && zoomRange.min < 1)
+    ? Math.round(zoomRange.min * 10) / 10
+    : null;
+  // Third route to the ultra-wide (Pixel-class): a SEPARATE physical back
+  // camera with intrinsic zoom < 1, reached by rebinding to it via the
+  // `ultraWide` prop rather than by a sub-1 ratio on the logical camera.
+  const androidPhysicalWide = (Platform.OS === 'android' && zoomSupported === true
+      && zoomRange.min >= 1 && uwInfo?.available)
+    ? (Math.round((uwInfo.intrinsicZoom || 0.5) * 10) / 10)
+    : null;
+  const ultraWideReachable = !!ultraWide || androidWideMin !== null || androidPhysicalWide !== null;
+  const wideLabel = ultraWide ? 0.5 : (androidWideMin != null ? androidWideMin : androidPhysicalWide);
+  const ZOOM_PRESETS = ultraWideReachable ? [wideLabel, 1, 2, 5] : [1, 2, 5];
   const fmtZoom = (r) => (r < 1 ? String(r).replace('0.', '.') : String(r));
   const isActive = (r) => Math.abs(zoomRatio - r) < 0.05;
 
+  // Stock fallback (iOS always, Android when this device's zoom range never
+  // measured — e.g. probe still pending). expo-camera's `zoom` is a 0..1
+  // fraction, NOT a multiplier, and the mapping to real factors is
+  // device-specific and unknowable without the Android patch. Approximate,
+  // but it moves — which the old code, that handed CameraView a zoomRatio
+  // prop iOS silently ignores, did not.
+  const zoomFraction = Math.max(0, Math.min(1, (zoomRatio - 1) / (ASSUMED_MAX_FACTOR - 1)));
+
+  // Exactly one zoom prop, chosen by documented platform capability rather
+  // than inferred from an ambiguous probe result (see the effect above for
+  // why that inference broke iOS).
+  // While bound to the physical ultra-wide, that camera's own zoom scale
+  // starts at ITS 1.0 (which is the ~0.5x field of view) — passing the
+  // display value (0.5) would just clamp anyway, but passing 1 explicitly
+  // keeps the intent readable. `ultraWide` is only ever handed to the native
+  // view on a patched binary (zoomSupported === true is the probe-proven
+  // signal the patch compiled in), same rule as zoomRatio.
+  const zoomProps = Platform.OS === 'android' && zoomSupported === true
+    ? { zoomRatio: uwCam ? 1 : zoomRatio, ultraWide: uwCam }
+    : { zoom: zoomFraction };
+
   const applyPreset = (r) => {
-    // iOS reaches the ultra-wide by swapping lens; Android does it by asking
-    // for a sub-1x ratio on the logical camera.
+    // iOS reaches the ultra-wide by swapping the physical lens; Android (when
+    // reachable at all) does it by asking for a sub-1x ratio on the same
+    // logical camera — two different mechanisms, both triggered here by "is
+    // this preset below 1x".
     if (ultraWide) setLensOverride(r < 1 ? ultraWide : null);
     updateZoom(r);
   };
@@ -545,14 +768,16 @@ export default function CameraScreen({ navigation, route }) {
     <View style={styles.root}>
       <GestureDetector gesture={pinchGesture}>
         {/* Unmounted while unfocused so Decoder's CameraView can take the
-            camera session and hand it back cleanly (was: black preview). */}
-        {isFocused ? (
+            camera session and hand it back cleanly. Remount is debounced
+            via camMounted (not raw isFocused) so this doesn't try to
+            reacquire the session before the outgoing screen has released it. */}
+        {camMounted ? (
         <CameraView
           ref={cam}
           style={StyleSheet.absoluteFill}
           facing="back"
           mode={camMode}
-          {...(zoomSupported ? { zoomRatio } : null)}
+          {...zoomProps}
           selectedLens={lensOverride || undefined}
           enableTorch={torchOn}
           // 'off' means "autofocus continuously as needed" per expo-camera;
@@ -565,17 +790,10 @@ export default function CameraScreen({ navigation, route }) {
         ) : <View style={[StyleSheet.absoluteFill, { backgroundColor: '#000' }]} />}
       </GestureDetector>
 
-      {/* Flagging indicator. Drawn as four explicit edge bars rather than a
-          borderWidth on one absolute-fill View — that only rendered along the
-          top edge in the field. Bars can't be partially clipped. */}
-      {flagOn && (
-        <View pointerEvents="none" style={styles.flagFrame}>
-          <View style={[styles.flagBar, { top: 0, left: 0, right: 0, height: FLAG_BAR }]} />
-          <View style={[styles.flagBar, { bottom: 0, left: 0, right: 0, height: FLAG_BAR }]} />
-          <View style={[styles.flagBar, { top: 0, bottom: 0, left: 0, width: FLAG_BAR }]} />
-          <View style={[styles.flagBar, { top: 0, bottom: 0, right: 0, width: FLAG_BAR }]} />
-        </View>
-      )}
+      {/* Flag frame is rendered LAST, near the end of this tree — see note
+          there. Android composites sibling views in declaration order and
+          treats zIndex as only a hint, so drawing it here left the bottom and
+          side bars underneath the controls. */}
 
       {/* Visible full-screen composite: the just-taken photo with the watermark
           burned in. Shown briefly while ViewShot captures it (a black-frame-free
@@ -610,9 +828,13 @@ export default function CameraScreen({ navigation, route }) {
         </Pressable>
       )}
 
-      {/* Recording timer — unmistakable proof capture is actually running. */}
+      {/* Recording timer — unmistakable proof capture is actually running.
+          Cleared the Floor/Room toolbar row, but the row is label + pill
+          (an ~11px "ROOM" caption ABOVE a 38px pill), so offsetting by the
+          pill height alone still left it grazing the room name. Offset by the
+          full row height instead, plus a real gap. */}
       {recording && (
-        <View style={[styles.recTimer, { top: insets.top + 12 }]}>
+        <View style={[styles.recTimer, { top: insets.top + 12 + TOOLBAR_ROW_H + 22 }]}>
           <View style={styles.recDot} />
           <Text style={styles.recTimerText}>
             {`${String(Math.floor(elapsed / 60)).padStart(2, '0')}:${String(elapsed % 60).padStart(2, '0')}`}
@@ -669,7 +891,7 @@ export default function CameraScreen({ navigation, route }) {
             </Pressable>
           </Pill>
 
-          <Pressable onPress={() => navigation?.navigate?.('ProjectHome', { projectId })} disabled={recording}>
+          <Pressable onPress={() => navigation?.navigate?.('Finalize', { projectId })} disabled={recording}>
             <LinearGradient
               colors={gradient.action}
               locations={gradient.actionStops}
@@ -682,24 +904,9 @@ export default function CameraScreen({ navigation, route }) {
           </Pressable>
         </View>
 
-        {/* SYSTEM is multi-select: tap any that apply, or none for a
-            general shot. Most survey photos aren't single-discipline. */}
-        <View style={[styles.toolbarRow, { marginTop: 6, gap: 6 }]}>
-          {SYSTEMS.filter((x) => x !== 'GEN').map((id) => {
-            const on = systems.includes(id);
-            return (
-              <Pressable
-                key={id}
-                onPress={() => toggleSystem(id)}
-                style={[styles.sysChip, on && styles.sysChipOn]}
-                hitSlop={6}
-              >
-                <Text style={[styles.sysChipText, on && styles.sysChipTextOn]}>{id}</Text>
-              </Pressable>
-            );
-          })}
-          {systems.length === 0 && <Text style={styles.sysGeneral}>GENERAL</Text>}
-        </View>
+        {/* System tagging moved to the Finalize review screen — tagging
+            mid-shot in the field is where mistakes happen; tagging during
+            review after the walkthrough is where they get caught. */}
       </Animated.View>
 
       {libWarning && !libWarningDismissed && (
@@ -857,6 +1064,39 @@ export default function CameraScreen({ navigation, route }) {
           </View>
         </View>
       </Modal>
+
+      {/* Flagging indicator. Previously four separate absolutely-positioned
+          bars — correct in the source (last child, zIndex 90) but still
+          rendered top-edge-only in the field. GalleryScreen's viewer proves a
+          plain borderWidth frame paints fine on a full-bleed Image, so the
+          fault wasn't "React Native can't draw a border" — it was something
+          about compositing four independent siblings over a native camera
+          preview layer specifically on this screen.
+          An <Svg> stroked rect sidesteps the whole question: it's ONE
+          rasterized paint operation, not four Views that can each succeed or
+          fail to composite independently, so partial rendering isn't
+          structurally possible. The rx corner radius is also the fix for the
+          separate "yellow looks cut off at the rounded corners" report — a
+          frame drawn to the device's sharp mathematical corner gets visually
+          clipped by the physical corner curvature; rounding it to roughly
+          match a modern phone's corner radius reads as intentional instead. */}
+      {flagOn && winW > 0 && winH > 0 && (
+        <View pointerEvents="none" style={styles.flagFrame}>
+          <Svg width={winW} height={winH}>
+            <Rect
+              x={FLAG_BAR / 2}
+              y={FLAG_BAR / 2}
+              width={winW - FLAG_BAR}
+              height={winH - FLAG_BAR}
+              rx={34}
+              ry={34}
+              fill="none"
+              stroke="#f2c744"
+              strokeWidth={FLAG_BAR}
+            />
+          </Svg>
+        </View>
+      )}
     </View>
   );
 }
@@ -896,9 +1136,14 @@ const styles = StyleSheet.create({
   },
   flagMomentText: { ...font(700, 14), color: color.ink },
 
-  // Four-bar flagging frame (see render note).
-  flagFrame: { ...StyleSheet.absoluteFillObject, zIndex: 60 },
-  flagBar: { position: 'absolute', backgroundColor: '#f2c744' },
+  // Four-bar flagging frame. zIndex must beat every other overlay: the
+  // controls row and bottom bar sit at zIndex 65 and the rec timer at 70, and
+  // they're painted over the bottom/side bars — which is why only the TOP bar
+  // was visible in the field. 90 puts the frame above the lot.
+  // Container for the SVG frame — zIndex kept high defensively, though an
+  // <Svg> paints as one unit so it no longer depends on winning a stacking
+  // fight the way four separate bars did.
+  flagFrame: { ...StyleSheet.absoluteFillObject, zIndex: 90 },
 
   zoomPill: {
     position: 'absolute', alignSelf: 'center', flexDirection: 'row',
@@ -922,17 +1167,6 @@ const styles = StyleSheet.create({
   },
   recDot: { width: 9, height: 9, borderRadius: 5, backgroundColor: '#e5484d' },
   recTimerText: { ...font(700, 13, { mono: true }), color: '#fff' },
-
-  sysChip: {
-    height: 30, paddingHorizontal: 11, borderRadius: 15,
-    alignItems: 'center', justifyContent: 'center',
-    backgroundColor: color.pillFill,
-    borderWidth: 1, borderColor: color.cardBorderSoft,
-  },
-  sysChipOn: { backgroundColor: color.accent, borderColor: color.accent },
-  sysChipText: { ...font(700, 11, { mono: true, ls: 0.4 }), color: color.text45 },
-  sysChipTextOn: { color: color.ink },
-  sysGeneral: { ...font(700, 10, { mono: true, ls: 0.8 }), color: color.text40, alignSelf: 'center', marginLeft: 2 },
 
   bottomBar: {
     position: 'absolute', left: 12, right: 12, zIndex: 65,

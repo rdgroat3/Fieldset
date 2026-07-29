@@ -1,4 +1,4 @@
-// MEP Survey Pro — nameplate decode proxy (Cloudflare Worker).
+// Fieldset — nameplate decode proxy (Cloudflare Worker).
 //
 // WHY THIS EXISTS: the app must never ship with an embedded API key
 // (anyone can extract it from the binary and run up your bill). This

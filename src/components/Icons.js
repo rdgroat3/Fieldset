@@ -1,6 +1,6 @@
 import React from 'react';
 import { View } from 'react-native';
-import Svg, { Path, Circle, Rect, Line, Polygon } from 'react-native-svg';
+import Svg, { Path, Circle, Rect, Line, Polygon, Ellipse } from 'react-native-svg';
 import { color } from '../theme/tokens';
 
 const A = color.accent;
@@ -118,13 +118,20 @@ export const HealthcareIcon = glyph((s) => (
   </>
 ));
 
-/** Restaurant: fork + knife. */
+/** Restaurant: fork + spoon. The right-hand shape was a knife, drawn as a
+ *  tapered blade outline — at 16px that read as a second fork tine or a stray
+ *  stroke. A spoon's filled bowl is unambiguous at any size. */
 export const RestaurantIcon = glyph((s) => (
   <>
-    <Path d="M4 2.5v3.2a1.6 1.6 0 0 0 3.2 0V2.5" stroke={s} strokeWidth={1.3} strokeLinecap="round" />
-    <Line x1="5.6" y1="6.9" x2="5.6" y2="13.5" stroke={s} strokeWidth={1.3} strokeLinecap="round" />
-    <Path d="M11.4 2.5c1.5 1.9 1.5 4.7 0 6.4" stroke={s} strokeWidth={1.3} strokeLinecap="round" strokeLinejoin="round" />
-    <Line x1="11.4" y1="8.4" x2="11.4" y2="13.5" stroke={s} strokeWidth={1.3} strokeLinecap="round" />
+    {/* Fork: three tines over a shared neck + handle. */}
+    <Line x1="3.4" y1="2.5" x2="3.4" y2="5.4" stroke={s} strokeWidth={1.1} strokeLinecap="round" />
+    <Line x1="5" y1="2.5" x2="5" y2="5.4" stroke={s} strokeWidth={1.1} strokeLinecap="round" />
+    <Line x1="6.6" y1="2.5" x2="6.6" y2="5.4" stroke={s} strokeWidth={1.1} strokeLinecap="round" />
+    <Path d="M2.8 5.3h4.4a1 1 0 0 1-1 1.8H3.8a1 1 0 0 1-1-1.8z" fill={s} />
+    <Line x1="5" y1="7" x2="5" y2="13.5" stroke={s} strokeWidth={1.3} strokeLinecap="round" />
+    {/* Spoon: filled oval bowl + handle. */}
+    <Ellipse cx="11.2" cy="4.6" rx="1.9" ry="2.5" fill={s} />
+    <Line x1="11.2" y1="7.1" x2="11.2" y2="13.5" stroke={s} strokeWidth={1.3} strokeLinecap="round" />
   </>
 ));
 
@@ -157,12 +164,27 @@ export const RetailIcon = glyph((s) => (
   </>
 ));
 
-/** Exterior: sun above a roofline — outdoors / roof / site work. */
+/** Exterior: sun with rays above a building on a ground line — outdoors /
+ *  roof / site work. The old version paired a HOLLOW circle with a bare
+ *  roofline polyline: with no rays the circle read as a generic dot, and the
+ *  roofline had no ground reference so it looked like an arbitrary zigzag.
+ *  Rays make the sun unmistakable; the ground line anchors the building as a
+ *  structure seen from OUTSIDE. */
 export const ExteriorIcon = glyph((s) => (
   <>
-    <Circle cx="11.3" cy="4.4" r="2.1" stroke={s} strokeWidth={1.2} />
-    <Path d="M2 13.6h12" stroke={s} strokeWidth={1.3} strokeLinecap="round" />
-    <Path d="M3.4 13.6V8.2L7.6 5.4v8.2" stroke={s} strokeWidth={1.3} strokeLinecap="round" strokeLinejoin="round" />
+    {/* Sun: filled disc + four rays. */}
+    <Circle cx="11.6" cy="4.2" r="1.9" fill={s} />
+    <Line x1="11.6" y1="0.9" x2="11.6" y2="1.7" stroke={s} strokeWidth={1.1} strokeLinecap="round" />
+    <Line x1="14.9" y1="4.2" x2="14.1" y2="4.2" stroke={s} strokeWidth={1.1} strokeLinecap="round" />
+    <Line x1="13.95" y1="1.85" x2="13.4" y2="2.4" stroke={s} strokeWidth={1.1} strokeLinecap="round" />
+    <Line x1="9.25" y1="1.85" x2="9.8" y2="2.4" stroke={s} strokeWidth={1.1} strokeLinecap="round" />
+    {/* Ground line. */}
+    <Line x1="1.5" y1="13.8" x2="14.5" y2="13.8" stroke={s} strokeWidth={1.4} strokeLinecap="round" />
+    {/* Building: pitched roof + walls, sitting on the ground line. Walls start
+        at the eave line (8.1), not below it — a 0.5px gap between roof and
+        wall is invisible on a mockup and obvious at 16px on a phone. */}
+    <Path d="M2.2 8.1 6 5.2l3.8 2.9" stroke={s} strokeWidth={1.3} strokeLinecap="round" strokeLinejoin="round" />
+    <Path d="M3.3 8.1v5.7M8.7 8.1v5.7" stroke={s} strokeWidth={1.3} strokeLinecap="round" />
   </>
 ));
 

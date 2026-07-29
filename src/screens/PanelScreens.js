@@ -73,6 +73,7 @@ export function PanelDetailScreen({ route, navigation }) {
   const project = projects.find((p) => p.id === projectId);
   const panel = project?.panels.find((pn) => pn.id === panelId);
   const [exporting, setExporting] = useState(false);
+  const [exportProgress, setExportProgress] = useState(null);
   if (!panel) return null;
 
   const shoot = async (zone) => {
@@ -98,12 +99,37 @@ export function PanelDetailScreen({ route, navigation }) {
     }
   };
 
+  /**
+   * Build the panel sheet, then hand it to the share sheet.
+   *
+   * `share: true` is explicit now. exportPanelSheet's `share` option used to
+   * default to true, so this call relied on that default; the export engine
+   * now defaults it to false (generating and sending are separate actions
+   * everywhere else), which would have silently turned this button into a
+   * no-op from the user's point of view \u2014 a PDF written to disk with
+   * nothing on screen to say so.
+   */
   const doExport = async () => {
     setExporting(true);
-    try { await exportPanelSheet(project, panel, settings); }
-    catch (e) { Alert.alert('Export failed', String(e)); }
-    finally { setExporting(false); }
+    setExportProgress(null);
+    try {
+      await exportPanelSheet(project, panel, settings, {
+        share: true,
+        onProgress: (p) => setExportProgress(p),
+      });
+    } catch (e) {
+      Alert.alert('Export failed', String(e?.message || e));
+    } finally {
+      setExporting(false);
+      setExportProgress(null);
+    }
   };
+
+  const exportLabel = !exporting
+    ? 'EXPORT PANEL PROFILE SHEET (PDF)'
+    : exportProgress?.total
+      ? `BUILDING PDF\u2026 ${exportProgress.done}/${exportProgress.total}`
+      : 'BUILDING PDF\u2026';
 
   const Zone = ({ label, uris, zone, single }) => (
     <View style={s.zone}>
@@ -155,7 +181,7 @@ export function PanelDetailScreen({ route, navigation }) {
           <Zone label="ZONE B — LEFT BREAKER COLUMN (odd)" uris={panel.leftPhotos} zone="left" />
           <Zone label="ZONE B — RIGHT BREAKER COLUMN (even)" uris={panel.rightPhotos} zone="right" />
 
-          <Btn label={exporting ? 'BUILDING PDF…' : 'EXPORT PANEL PROFILE SHEET (PDF)'} onPress={doExport} style={{ marginTop: 16 }} />
+          <Btn label={exportLabel} onPress={doExport} disabled={exporting} style={{ marginTop: 16 }} />
         </ScrollView>
       </View>
     </Backdrop>

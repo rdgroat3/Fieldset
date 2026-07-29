@@ -26,6 +26,10 @@
     },
     "android": {
       "package": "com.yourcompany.mepsurveypro",
+      "adaptiveIcon": {
+        "foregroundImage": "./adaptive-icon-foreground.png",
+        "backgroundColor": "#0D1117"
+      },
       "permissions": [
         "CAMERA",
         "RECORD_AUDIO",

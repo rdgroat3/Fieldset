@@ -5,6 +5,7 @@ import { DECODE_DB, DECODE_DB_VERSION } from './decodeDB.js';
 import {
   decodeYearFromSerial, decodeCapacity, detectBrand,
   detectBrandFromModel, decodeSerialCandidates, brandInfo, catalogStats,
+  sanityCheckCapacity,
 } from './hvacDecode.js';
 
 let pass = 0, fail = 0;
@@ -23,6 +24,57 @@ for (const brand of DECODE_DB) {
       ok(yOk && mOk && wOk, `${brand.name} [${rule.id}] ${serial} -> ${JSON.stringify(expect)}`, r);
     }
   }
+}
+
+// 1b) Every CAPACITY example declared in the DB.
+//
+// This block did not exist. `examples` was only ever run against
+// serialRules, so a capacityRule could declare examples and have them
+// silently ignored — the rule was effectively untested, and a regression in
+// it would surface as a wrong tonnage on a customer's condition report
+// rather than as a red test. Capacity is the field most likely to be read
+// off the report and acted on, so it needs at least the same coverage the
+// serial decode already had.
+for (const brand of DECODE_DB) {
+  for (const rule of brand.capacityRules || []) {
+    for (const [model, expectTons] of rule.examples || []) {
+      const r = decodeCapacity(model, brand.category || 'hvac', brand.name);
+      ok(r && r.value === expectTons && r.confidence === rule.confidence,
+        `${brand.name} [${rule.id}] ${model} -> ${expectTons} tons (${rule.confidence})`, r);
+    }
+  }
+}
+
+// 1c) Generic-scan honesty.
+//
+// An unanchored digit match must never claim 'high' confidence. It used to,
+// which put "a run of digits somewhere in this string happens to be a valid
+// code" on exactly the same footing as a decode anchored to a published
+// manufacturer nomenclature table. Both the Decoder UI and the exported
+// condition report read `confidence` to decide how firmly to state a
+// number, so this is a correctness property, not a cosmetic one.
+{
+  const generic = decodeCapacity('QQ036ZZ', 'hvac', undefined);
+  ok(!generic || generic.confidence !== 'high',
+    'unanchored generic capacity match never claims high confidence', generic);
+  ok(!generic || generic.generic === true,
+    'unanchored generic capacity match is flagged generic:true', generic);
+}
+
+// A brand we DO hold nomenclature for, given a model that fits none of its
+// rules, must decline rather than fall through to the blind scan. Knowing
+// how Carrier writes a model number and seeing a string that isn't one is
+// evidence AGAINST a coincidental digit run being the capacity.
+{
+  const r = decodeCapacity('CARRIERWIDGET036X', 'hvac', 'Carrier');
+  ok(r === null, 'known-nomenclature brand declines rather than blind-scanning', r);
+}
+
+// The regression this rule exists for: a 20-ton commercial Carrier rooftop
+// used to decode as 2 tons via the shared 2-digit grid.
+{
+  const r = decodeCapacity('48TCDD24A1G6-0A0A0', 'hvac', 'Carrier');
+  ok(r && r.value === 20, '48TC size 24 is 20 tons, not 2', r);
 }
 
 // 2) Capacity suite (model -> tons / gallons).
@@ -98,6 +150,34 @@ ok(lx && lx.year === 2006, 'Lennox 1606B -> 2006', lx);
 ok(lx && rankOf(lx.monthConfidence) < rankOf(lx.confidence),
   'Lennox month confidence de-rated below year confidence', lx);
 
+// 7b) Real field nameplates (2026-07 decoder-accuracy pass) — each of these
+// serials was cross-checked BY HAND against the printed "MFG DATE" / "DATE
+// OF MANUFACTURE" field on the same physical plate, so these aren't just
+// internally-consistent regex matches, they're independently confirmed
+// correct decodes.
+const traneField = [
+  // TWA120A300FB, printed MFG. DATE 05/2005 -> week 18 of 2005 (early May).
+  ['51835S9AD', 'Trane', 'hvac', 2005],
+  // 4TTR3036E1000AA (Trane XR13), printed MFR DATE 8/2014 -> week 34 (Aug).
+  ['14341UTM3F', 'Trane', 'hvac', 2014],
+  // 2A7A1024A1000AA (American Standard "Allegiance 11"), printed MFR DATE
+  // 12/2004 -> week 50 (mid-December).
+  ['4504K4Y5F', 'Trane', 'hvac', 2004],
+];
+for (const [serial, brand, cat, year] of traneField) {
+  const r = decodeYearFromSerial(serial, brand, cat);
+  ok(r && r.year === year, `${brand} field serial "${serial}" -> ${year}`, r);
+}
+// Carrier field nameplates, same treatment (printed "DATE OF MANUFACTURE").
+const carrierField = [
+  ['3022E17964', 'Carrier', 'hvac', 2022], // 25HCE460A500, printed JUL 2022
+  ['2722F14427', 'Carrier', 'hvac', 2022], // FB4CNP061, printed JUL 2022
+];
+for (const [serial, brand, cat, year] of carrierField) {
+  const r = decodeYearFromSerial(serial, brand, cat);
+  ok(r && r.year === year, `${brand} field serial "${serial}" -> ${year}`, r);
+}
+
 // 8) Brand detection from model nomenclature (fallback when OCR misses the
 // brand text). Narrow by design: a false brand match picks the wrong serial
 // rules, which is worse than no brand at all.
@@ -105,11 +185,25 @@ const modelDet = [
   ['4TTR4036A1000AA', 'hvac', 'Trane'],
   ['GSX130241', 'hvac', 'Goodman'],
   ['ZZQQ999', 'hvac', null],
+  // Confirmed from real field nameplates during the 2026-07 decoder-accuracy
+  // pass — each of these previously matched NO brand at all via nomenclature.
+  ['GSC130361GB', 'hvac', 'Goodman'],                 // Goodman GSC single-stage AC
+  ['13HPX-048-230-18', 'hvac', 'Lennox'],              // Lennox HPX heat pump line
+  ['14HPX-060-230-19', 'hvac', 'Lennox'],
+  ['2A7A1024A1000AA', 'hvac', 'Trane'],                // Trane/American Standard "Allegiance"
 ];
 for (const [model, cat, want] of modelDet) {
   ok(detectBrandFromModel(model, cat) === want,
     `detectBrandFromModel "${model}" -> ${want}`, detectBrandFromModel(model, cat));
 }
+
+// 8b) Capacity still decodes correctly for the newly-recognized model
+// families above — brand detection without a correct capacity read is only
+// half the fix.
+ok(decodeCapacity('GSC130361GB', 'hvac', 'Goodman')?.value === 3,
+  'Goodman GSC130361GB -> 3 tons', decodeCapacity('GSC130361GB', 'hvac', 'Goodman'));
+ok(decodeCapacity('13HPX-048-230-18', 'hvac', 'Lennox')?.value === 4,
+  'Lennox 13HPX-048 -> 4 tons', decodeCapacity('13HPX-048-230-18', 'hvac', 'Lennox'));
 
 // 9) Rule-free brands must say "read the plate", never guess a year.
 // ~half the catalog is deliberately rule-free; that is the accuracy-over-
@@ -219,6 +313,61 @@ ok(detectBrand('YORKINTL unit', 'hvac') === 'York',
 // plain "abb" must not resolve to GE.
 ok(detectBrand('ABB switchgear', 'electrical') === 'ABB', 'ABB resolves to ABB, not GE', detectBrand('ABB switchgear', 'electrical'));
 
+
+// 15) Capacity/electrical cross-check.
+//
+// An independent second opinion on a decoded tonnage using a DIFFERENT
+// field on the same plate. Every capacity decode reads the model number,
+// so a bad nomenclature rule has nothing to contradict it — which is how a
+// 20-ton rooftop came back as 2 tons with full confidence. Must fire on
+// gross mismatches and stay quiet on real machines, including the awkward
+// ones (strip heat raises MCA a long way at a fixed tonnage).
+{
+  const gross = sanityCheckCapacity({ tons: 2, volts: 208, phase: 3, rla: 30 });
+  ok(gross && gross.ok === false && gross.direction === 'capacity-too-small',
+    'cross-check flags a 2-ton decode on a 20-ton electrical rating', gross);
+
+  const right = sanityCheckCapacity({ tons: 20, volts: 208, phase: 3, rla: 30 });
+  ok(right && right.ok === true, 'cross-check stays quiet on a consistent 20-ton plate', right);
+
+  const stripHeat = sanityCheckCapacity({ tons: 3, volts: 230, phase: 1, mca: 44 });
+  ok(stripHeat && stripHeat.ok === true,
+    'cross-check stays quiet on a 3-ton with auxiliary electric heat', stripHeat);
+
+  const huge = sanityCheckCapacity({ tons: 50, volts: 230, phase: 1, mca: 32 });
+  ok(huge && huge.ok === false && huge.direction === 'capacity-too-large',
+    'cross-check flags a 50-ton decode on a residential electrical rating', huge);
+
+  ok(sanityCheckCapacity({ tons: 5, volts: null, phase: null, mca: null }) === null,
+    'cross-check says nothing without electrical data', 'null expected');
+  ok(sanityCheckCapacity({ tons: 5, volts: 999, phase: 3, mca: 20 }) === null,
+    'cross-check says nothing for an unrecognised supply voltage', 'null expected');
+}
+
+// 16) Brand ranking: unit brand beats component brand.
+//
+// A condensing unit photographed with its compressor label in frame used to
+// report the COMPRESSOR maker as the equipment brand, because ranking was
+// by alias length alone and "copeland" is longer than "lennox". Everything
+// downstream then applied the wrong serial rules.
+{
+  const plate = 'LENNOX INDUSTRIES\nMODEL XC13-036-230\nSERIAL 5811A12345\nCOMPRESSOR\nCOPELAND\nZR40KC-PFV-230';
+  ok(detectBrand(plate, 'hvac') === 'Lennox',
+    'unit brand wins over an in-frame compressor label', detectBrand(plate, 'hvac'));
+}
+
+// 17) Brand aliases survive plate punctuation.
+//
+// Real plates print "A. O. SMITH" — periods AND spaces. Neither substring
+// nor word-boundary matching bridged that to the "a.o. smith" alias, so the
+// brand came back null and the whole chain below it (serial rules, year,
+// condition assessment) went dark.
+for (const form of ['A. O. SMITH', 'A.O. SMITH', 'AO SMITH', 'A O Smith']) {
+  const got = detectBrand(`${form}\nWATER HEATER\nMODEL DEL-52`, 'waterheater');
+  ok(!!got && /smith/i.test(got), `brand alias matches punctuated form "${form}"`, got);
+}
+
+// ── summary (must stay last so every block above is counted) ──
 console.log(`\nDecode DB v${DECODE_DB_VERSION}`);
 console.log(`${stats.total} brands, ${stats.withRules} with verified serial rules, ${stats.rules} rules, ${stats.examples} declared examples`);
 console.log(bad.join('\n'));

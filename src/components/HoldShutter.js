@@ -14,8 +14,21 @@ const SHUTTER = 74;           // outer shutter diameter
 const RING = 84;              // progress ring diameter
 const OPTION_LG = 64;         // center (Video) option
 const OPTION_SM = 52;         // side options
-const COL_W = 90;             // fixed column width per option
-const ROW_LIFT = 96;          // how far above the shutter the option row sits
+const COL_W = 90;             // fixed column width per option (label wrap width)
+
+// Arc geometry: options fan out above the shutter along a circle instead of
+// sitting in a straight row, so they read as "radial" rather than a toolbar.
+const ARC_RADIUS = 108;       // distance from shutter center to each option
+const ARC_SPAN_DEG = 100;     // total angular spread of the fan, centered on straight-up
+const ARC_CENTER_DEG = -90;   // straight up, in standard (x right, y down) degrees
+
+// Per-option capture: how close the finger needs to be to an option's center
+// to select it, and the hard outer radius past which nothing selects (drops
+// back to "no option" — released there, it does nothing, matching the
+// existing "back out" behavior). Both are generous vs. the old tight column
+// math, which is what made the radial feel overly sensitive/twitchy.
+const CAPTURE_RADIUS = 46;
+const DEADZONE_RADIUS = 30;   // must clear the shutter itself before any option can arm
 
 const AProgress = Animated.createAnimatedComponent(Circle);
 
@@ -82,24 +95,40 @@ export default function HoldShutter({ onPhoto, onSelectMode, onArmChange, labels
     armedRef.value = 0;
   };
 
-  /** Map the finger's x/y (relative to shutter center) to an option id, or null.
-   *  Columns are evenly spaced and centered on the shutter, so this works for
-   *  any option count (was hard-coded to 3). */
+  // Each option's fixed (x, y) offset from the shutter center, spread evenly
+  // across the arc. Computed once per options set (not per gesture frame).
+  const positions = React.useMemo(() => {
+    const n = OPTIONS.length;
+    return OPTIONS.map((o, i) => {
+      // Single option sits dead center (straight up); multiple options
+      // spread evenly across the arc, in index order left-to-right.
+      const t = n === 1 ? 0.5 : i / (n - 1);
+      const deg = ARC_CENTER_DEG - ARC_SPAN_DEG / 2 + t * ARC_SPAN_DEG;
+      const rad = (deg * Math.PI) / 180;
+      return { id: o.id, x: Math.cos(rad) * ARC_RADIUS, y: Math.sin(rad) * ARC_RADIUS };
+    });
+  }, [OPTIONS]);
+
+  /** Nearest-option-within-radius: finds the closest arc position to the
+   *  finger and selects it only if within CAPTURE_RADIUS. Anything beyond
+   *  that (including the empty space between options) selects nothing,
+   *  which is the "go too far and it deselects" behavior. */
   const hitTest = (x, y) => {
     'worklet';
     if (open.value < 0.5) return null;
-    // Options live in a row lifted above the shutter. Only select when the finger
-    // has traveled up toward the row (y sufficiently negative) — a straight hold
-    // with no drag stays on "photo".
-    if (y > -24) return null;
-    const n = OPTIONS.length;
-    const rowW = n * COL_W;
-    // finger x relative to the row's left edge
-    const fromLeft = x + rowW / 2;
-    let idx = Math.floor(fromLeft / COL_W);
-    if (idx < 0) idx = 0;
-    if (idx > n - 1) idx = n - 1;
-    return OPTIONS[idx].id;
+    const distFromCenter = Math.sqrt(x * x + y * y);
+    if (distFromCenter < DEADZONE_RADIUS) return null;
+    let best = null;
+    let bestDist = Infinity;
+    for (let i = 0; i < positions.length; i++) {
+      const p = positions[i];
+      const dx = x - p.x;
+      const dy = y - p.y;
+      const d = Math.sqrt(dx * dx + dy * dy);
+      if (d < bestDist) { bestDist = d; best = p.id; }
+    }
+    if (bestDist > CAPTURE_RADIUS) return null;
+    return best;
   };
 
   const gesture = Gesture.Pan()
@@ -150,15 +179,23 @@ export default function HoldShutter({ onPhoto, onSelectMode, onArmChange, labels
   const innerStyle = useAnimatedStyle(() => ({ transform: [{ scale: innerScale.value }] }));
   const rowStyle = useAnimatedStyle(() => ({
     opacity: open.value,
-    transform: [{ translateY: interpolate(open.value, [0, 1], [20, -ROW_LIFT]) }],
+    transform: [{ scale: interpolate(open.value, [0, 1], [0.85, 1]) }],
   }));
 
   return (
     <View style={styles.wrap} pointerEvents="box-none">
-      {/* Radial option row */}
-      <Animated.View style={[styles.optionRow, rowStyle]} pointerEvents="none">
-        {OPTIONS.map((o) => (
-          <Option key={o.id} option={o} active={active === o.id} labelsOn={labelsOn} />
+      {/* Radial options, fanned along an arc above the shutter. */}
+      <Animated.View style={[styles.arcLayer, rowStyle]} pointerEvents="none">
+        {OPTIONS.map((o, i) => (
+          <View
+            key={o.id}
+            style={[
+              styles.arcSlot,
+              { left: RING / 2 + positions[i].x - COL_W / 2, top: RING / 2 + positions[i].y - COL_W / 2 },
+            ]}
+          >
+            <Option option={o} active={active === o.id} labelsOn={labelsOn} />
+          </View>
         ))}
       </Animated.View>
 
@@ -197,14 +234,13 @@ export default function HoldShutter({ onPhoto, onSelectMode, onArmChange, labels
 function Option({ option, active, labelsOn }) {
   const { size, center, Icon, label } = option;
   return (
-    <View style={styles.optionCol}>
+    <View style={styles.optionWrap}>
       <View
         style={[
           styles.option,
           { width: size, height: size, borderRadius: size / 2 },
           center && styles.optionCenter,
           active && styles.optionActive,
-          center && { transform: [{ translateY: -14 }] },
         ]}
       >
         {center ? (
@@ -218,10 +254,7 @@ function Option({ option, active, labelsOn }) {
         )}
       </View>
       {labelsOn && (
-        <Text
-          numberOfLines={1}
-          style={[styles.optionLabel, center && { transform: [{ translateY: -14 }] }]}
-        >
+        <Text numberOfLines={1} style={styles.optionLabel}>
           {label}
         </Text>
       )}
@@ -249,13 +282,16 @@ const styles = StyleSheet.create({
   // not "take a picture".
   shutterInnerVideo: { backgroundColor: '#e5484d' },
 
-  optionRow: {
+  arcLayer: {
     position: 'absolute',
-    flexDirection: 'row',
-    alignItems: 'flex-end',
-    justifyContent: 'center',
+    width: RING, height: RING,
+    // Centered on the shutter itself; children are placed absolutely inside
+    // via left/top computed from each option's arc offset.
   },
-  optionCol: { width: COL_W, alignItems: 'center' },
+  arcSlot: {
+    position: 'absolute', width: COL_W, alignItems: 'center',
+  },
+  optionWrap: { alignItems: 'center' },
   option: {
     alignItems: 'center', justifyContent: 'center',
     backgroundColor: 'rgba(20,22,26,.82)',

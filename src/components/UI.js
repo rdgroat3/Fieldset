@@ -3,12 +3,18 @@ import { Text, TouchableOpacity, View, TextInput, StyleSheet } from 'react-nativ
 import { TAP } from '../theme';
 import { color, radius, font } from '../theme/tokens';
 
-export const Btn = ({ label, onPress, kind = 'primary', style, small }) => (
+// `disabled` was accepted by callers but never wired to TouchableOpacity, so
+// passing it did nothing: the Panel export button stayed live while a PDF was
+// being built, and a second tap started a second concurrent export of the
+// same panel. Both wrote to the same filename.
+export const Btn = ({ label, onPress, kind = 'primary', style, small, disabled }) => (
   <TouchableOpacity
     onPress={onPress}
+    disabled={disabled}
     activeOpacity={0.8}
     style={[
       s.btn,
+      disabled && { opacity: 0.55 },
       kind === 'primary' && { backgroundColor: color.accent },
       kind === 'ghost' && { backgroundColor: color.cardFill, borderWidth: 1, borderColor: color.cardBorder },
       kind === 'danger' && { backgroundColor: '#e5484d' },

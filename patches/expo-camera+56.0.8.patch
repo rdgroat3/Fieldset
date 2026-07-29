@@ -1,8 +1,8 @@
 diff --git a/node_modules/expo-camera/android/src/main/java/expo/modules/camera/CameraViewModule.kt b/node_modules/expo-camera/android/src/main/java/expo/modules/camera/CameraViewModule.kt
-index 21382f8..d4a3ec8 100644
+index 21382f8..b99287f 100644
 --- a/node_modules/expo-camera/android/src/main/java/expo/modules/camera/CameraViewModule.kt
 +++ b/node_modules/expo-camera/android/src/main/java/expo/modules/camera/CameraViewModule.kt
-@@ -306,6 +306,18 @@ class CameraViewModule : Module() {
+@@ -306,6 +306,35 @@ class CameraViewModule : Module() {
          }
        }
  
@@ -18,14 +18,31 @@ index 21382f8..d4a3ec8 100644
 +        view.zoomRange()
 +      }
 +
++      // Fieldset patch: bind the physical ultra-wide back camera when true.
++      Prop("ultraWide") { view, enabled: Boolean? ->
++        view.ultraWide = enabled ?: false
++      }
++
++      // Fieldset patch: does a separate physical ultra-wide camera exist?
++      AsyncFunction("getUltraWideInfo") { view: ExpoCameraView ->
++        view.ultraWideInfo()
++      }
++
++      // Fieldset patch: one-shot tap-to-focus at a normalized (0..1) point
++      // relative to the preview view. For close-up nameplate reads, where
++      // continuous AF often hunts instead of settling on a near target.
++      AsyncFunction("focusAt") { view: ExpoCameraView, x: Float, y: Float ->
++        view.focusAtPoint(x, y)
++      }
++
        Prop("mode") { view, mode: CameraMode? ->
          mode?.let {
            if (view.cameraMode != it) {
 diff --git a/node_modules/expo-camera/android/src/main/java/expo/modules/camera/ExpoCameraView.kt b/node_modules/expo-camera/android/src/main/java/expo/modules/camera/ExpoCameraView.kt
-index d9690e3..4bce5a4 100644
+index d9690e3..327e5fc 100644
 --- a/node_modules/expo-camera/android/src/main/java/expo/modules/camera/ExpoCameraView.kt
 +++ b/node_modules/expo-camera/android/src/main/java/expo/modules/camera/ExpoCameraView.kt
-@@ -162,6 +162,22 @@ class ExpoCameraView(
+@@ -162,6 +162,36 @@ class ExpoCameraView(
        setCameraZoom(value)
      }
  
@@ -43,15 +60,85 @@ index d9690e3..4bce5a4 100644
 +      field = value
 +      value?.let { applyZoomRatio(it) }
 +    }
++
++  // Fieldset patch: bind the SEPARATE physical ultra-wide back camera.
++  // Pixel-class devices expose the ultra-wide as its own camera rather than
++  // fusing it into the logical camera's zoom range (zoomState min stays at
++  // 1.0), so zoomRatio < 1 can never reach it — rebinding to the physical
++  // camera is the only way in. Toggling forces a camera recreate, exactly
++  // like switching lensFacing does.
++  var ultraWide: Boolean = false
++    set(value) {
++      if (field != value) {
++        field = value
++        shouldCreateCamera = true
++      }
++    }
 +  // -----------------------------------------------------------------------
 +
    var autoFocus: FocusMode = FocusMode.OFF
      set(value) {
        field = value
-@@ -632,6 +648,26 @@ class ExpoCameraView(
+@@ -465,8 +495,26 @@ class ExpoCameraView(
+       }
+     }
+ 
++    // Fieldset patch: when the physical ultra-wide is requested and exists,
++    // filter the selection down to exactly that camera. The filter falls back
++    // to the unfiltered list if the target ever fails to match (a filter that
++    // returns an empty list makes bindToLifecycle throw), so the worst case
++    // is the standard back camera — never a dead preview.
++    val uwTarget = if (ultraWide && lensFacing == CameraType.BACK) {
++      findUltraWideCameraInfo(cameraProvider)
++    } else {
++      null
++    }
+     val cameraSelector = CameraSelector.Builder()
+       .requireLensFacing(lensFacing.mapToCharacteristic())
++      .apply {
++        uwTarget?.let { target ->
++          addCameraFilter { infos ->
++            val hit = infos.filter { it === target || it == target }
++            if (hit.isNotEmpty()) hit else infos
++          }
++        }
++      }
+       .build()
+ 
+     // Screen flash only works with front camera - fall back to ON for back camera
+@@ -632,6 +680,83 @@ class ExpoCameraView(
      }
    }
  
++  // Fieldset patch: one-shot tap-to-focus at a point the JS side gives us as
++  // normalized (0..1, relative to the preview view) coordinates. This is
++  // separate from the `autoFocus` prop above — that toggles CameraX's default
++  // continuous 3A on/off; this drives a single focus-and-meter pass at an
++  // actual tapped location, which is what close-up nameplate reads need when
++  // continuous AF keeps hunting instead of settling on a near target.
++  // setAutoCancelDuration hands control back to normal continuous AF on its
++  // own a few seconds later, so this never permanently locks focus.
++  fun focusAtPoint(x: Float, y: Float) {
++    val cam = camera ?: return
++    val factory = DisplayOrientedMeteringPointFactory(
++      previewView.display,
++      cam.cameraInfo,
++      previewView.width.toFloat(),
++      previewView.height.toFloat()
++    )
++    val point = factory.createPoint(
++      x.coerceIn(0f, 1f) * previewView.width,
++      y.coerceIn(0f, 1f) * previewView.height
++    )
++    val action = FocusMeteringAction.Builder(
++      point,
++      FocusMeteringAction.FLAG_AF or FocusMeteringAction.FLAG_AE
++    )
++      .setAutoCancelDuration(4, java.util.concurrent.TimeUnit.SECONDS)
++      .build()
++    cam.cameraControl.startFocusAndMetering(action)
++  }
++
 +  // Fieldset patch: apply an absolute ratio, clamped to the real hardware
 +  // range. Safe on devices with no ultra-wide — minZoomRatio is simply 1.0f
 +  // there, so a 0.5f request clamps to 1.0x instead of misbehaving.
@@ -72,10 +159,38 @@ index d9690e3..4bce5a4 100644
 +    )
 +  }
 +
++  // Fieldset patch: find a back-facing camera whose intrinsic zoom factor is
++  // below 1.0 — the physical ultra-wide. Devices that fuse their lenses into
++  // one logical camera won't list one here (and don't need to: zoomRatio < 1
++  // already reaches their ultra-wide); devices that expose it separately
++  // (Pixels) will.
++  private fun findUltraWideCameraInfo(provider: ProcessCameraProvider): CameraInfo? =
++    try {
++      CameraSelector.DEFAULT_BACK_CAMERA.filter(provider.availableCameraInfos)
++        .filter { it.intrinsicZoomRatio < 0.99f }
++        .minByOrNull { it.intrinsicZoomRatio }
++    } catch (e: Exception) {
++      null
++    }
++
++  // Fieldset patch: probe for JS. `available` means a separate physical
++  // ultra-wide exists and the `ultraWide` prop can bind it. `ready` is false
++  // until the first camera bind has produced a provider to enumerate.
++  fun ultraWideInfo(): Map<String, Any> {
++    val provider = cameraProvider
++      ?: return mapOf("available" to false, "intrinsicZoom" to 0f, "ready" to false)
++    val uw = findUltraWideCameraInfo(provider)
++    return mapOf(
++      "available" to (uw != null),
++      "intrinsicZoom" to (uw?.intrinsicZoomRatio ?: 0f),
++      "ready" to true
++    )
++  }
++
    private fun setCameraZoom(value: Float) {
      val maxZoomRatio = camera?.cameraInfo?.zoomState?.value?.maxZoomRatio ?: 1f
      val targetZoomRatio = max(1f, min(maxZoomRatio, value.coerceIn(0f, 1f) * maxZoomRatio))
-@@ -644,6 +680,9 @@ class ExpoCameraView(
+@@ -644,6 +769,9 @@ class ExpoCameraView(
          CameraState.Type.OPEN -> {
            onCameraReady(Unit)
            setTorchEnabled(enableTorch)
@@ -86,10 +201,10 @@ index d9690e3..4bce5a4 100644
  
          else -> {}
 diff --git a/node_modules/expo-camera/build/CameraView.js b/node_modules/expo-camera/build/CameraView.js
-index 78f8198..93a988c 100644
+index 78f8198..ec9ed1a 100644
 --- a/node_modules/expo-camera/build/CameraView.js
 +++ b/node_modules/expo-camera/build/CameraView.js
-@@ -86,6 +86,15 @@ export default class CameraView extends Component {
+@@ -86,6 +86,34 @@ export default class CameraView extends Component {
      async getAvailableLensesAsync() {
          return (await this._cameraRef.current?.getAvailableLenses()) ?? [];
      }
@@ -101,6 +216,25 @@ index 78f8198..93a988c 100644
 +     */
 +    async getZoomRangeAsync() {
 +        return (await this._cameraRef.current?.getZoomRange?.()) ?? { min: 1, max: 1 };
++    }
++    /**
++     * Fieldset patch. Reports whether this device exposes the ultra-wide as
++     * a SEPARATE physical back camera (Pixel-style) instead of fusing it
++     * into the logical camera's zoom range. When `available`, pass the
++     * `ultraWide` prop to bind it. Android only; resolves unavailable
++     * elsewhere. `ready: false` means the camera hadn't bound yet — retry.
++     */
++    async getUltraWideInfoAsync() {
++        return (await this._cameraRef.current?.getUltraWideInfo?.()) ?? { available: false, intrinsicZoom: 0, ready: false };
++    }
++    /**
++     * Fieldset patch. One-shot tap-to-focus at a point given as normalized
++     * (0..1, 0..1) coordinates relative to the CameraView. Hands control back
++     * to normal continuous autofocus a few seconds later on its own.
++     * Android only; no-ops elsewhere.
++     */
++    async focusAtAsync(x, y) {
++        return (await this._cameraRef.current?.focusAt?.(x, y)) ?? false;
 +    }
      /**
       * Returns an object with the supported features of the camera on the current device.

@@ -22,11 +22,50 @@ export default function LandingScreen({ navigation }) {
     }).length;
   }, [projects]);
 
-  // Most-recently-created survey, for the Deliverables shortcut.
-  const latest = useMemo(() => {
+  /**
+   * Target for the Deliverables shortcut.
+   *
+   * Two things were wrong with the old version. It sorted by `createdAt`,
+   * which is the wrong clock — resume an older survey for a second day of
+   * capture and the shortcut still pointed at whatever was started most
+   * recently, i.e. a survey you weren't working on. And when there were
+   * several surveys it silently picked one and gave no indication which,
+   * so tapping "Deliverables" landed you in an export screen for a job you
+   * hadn't touched in weeks with nothing on screen naming it.
+   *
+   * Now: ranked by last ACTIVITY (newest capture, falling back to creation),
+   * the card names the survey it will open, and when there is more than one
+   * survey it stops guessing and sends you to the list to choose.
+   */
+  const lastActivity = (p) => {
+    let t = new Date(p.createdAt).getTime() || 0;
+    for (const ph of p.photos || []) {
+      const c = new Date(ph.takenAt).getTime();
+      if (c > t) t = c;
+    }
+    return t;
+  };
+
+  const recent = useMemo(() => {
     if (!projects.length) return null;
-    return [...projects].sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))[0];
+    return [...projects].sort((a, b) => lastActivity(b) - lastActivity(a))[0];
   }, [projects]);
+
+  const deliverablesSub = projects.length === 0
+    ? 'No surveys yet'
+    : projects.length === 1
+      ? `Export \u201c${recent.name}\u201d`
+      : 'Pick a survey';
+
+  const openDeliverables = () => {
+    if (projects.length === 1) {
+      navigation?.navigate?.('Export', { projectId: recent.id });
+    } else {
+      // pick:'export' makes the list route straight to the export screen
+      // instead of the survey home — same list, explicit destination.
+      navigation?.navigate?.('Projects', { pick: 'export' });
+    }
+  };
 
   // Back button on the main page asks for confirmation before exiting,
   // rather than just closing the app.
@@ -99,19 +138,14 @@ export default function LandingScreen({ navigation }) {
             icon={<ListIcon />}
             onPress={() => navigation?.navigate?.('Projects')}
           />
-          {/* Deliverables jumps STRAIGHT to the latest survey's exports —
-              otherwise it was a duplicate of Recent Surveys (both just opened
-              the same list). Falls back to the list only when there's no
-              obvious "latest". */}
+          {/* Deliverables is an ACTION on a survey, not a second copy of the
+              survey list — the card names its target, and defers to the
+              list rather than guessing when there's more than one. */}
           <ShortcutCard
             title="Deliverables"
-            sub={latest ? `Export \u201c${latest.name}\u201d` : 'No surveys yet'}
+            sub={deliverablesSub}
             icon={<DocIcon />}
-            onPress={() =>
-              latest
-                ? navigation?.navigate?.('Export', { projectId: latest.id })
-                : navigation?.navigate?.('Projects')
-            }
+            onPress={openDeliverables}
           />
         </View>
       </View>

@@ -68,11 +68,22 @@ export default function ProjectHomeScreen({ route, navigation }) {
           </View>
 
           <View style={styles.stats}>
-            {[[photoCount, 'PHOTOS'], [videoCount, 'VIDEOS'], [npCount, 'NAMEPLATES']].map(([v, l]) => (
-              <View key={l} style={styles.stat}>
-                <Text style={styles.statNum}>{v}</Text>
-                <Text style={styles.statLabel}>{l}</Text>
-              </View>
+            {[
+              [photoCount, 'PHOTOS', 'photo'],
+              [videoCount, 'VIDEOS', 'video'],
+              [npCount, 'NAMEPLATES', 'nameplate'],
+            ].map(([v, l, type]) => (
+              <Press
+                key={l}
+                onPress={() => v > 0 && navigation.navigate('Gallery', { projectId, filterType: type })}
+                disabled={v === 0}
+                style={{ flex: 1 }}
+              >
+                <View style={styles.stat}>
+                  <Text style={styles.statNum}>{v}</Text>
+                  <Text style={styles.statLabel}>{l}{v > 0 ? ' \u203a' : ''}</Text>
+                </View>
+              </Press>
             ))}
             <Press
               onPress={() => flagCount > 0 && navigation.navigate('Gallery', { projectId, filterFlagged: true })}
@@ -81,7 +92,7 @@ export default function ProjectHomeScreen({ route, navigation }) {
             >
               <View style={styles.stat}>
                 <Text style={[styles.statNum, flagCount > 0 && { color: '#e5484d' }]}>{flagCount}</Text>
-                <Text style={styles.statLabel}>FLAGS{flagCount > 0 ? ' ›' : ''}</Text>
+                <Text style={styles.statLabel}>FLAGS{flagCount > 0 ? ' \u203a' : ''}</Text>
               </View>
             </Press>
           </View>

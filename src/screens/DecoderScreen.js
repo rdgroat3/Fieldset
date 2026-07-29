@@ -1,5 +1,5 @@
 import React, { useRef, useState, useMemo } from 'react';
-import { View, Text, StyleSheet, Pressable, Image, Modal, FlatList, Alert, ActivityIndicator } from 'react-native';
+import { View, Text, StyleSheet, Pressable, Image, Modal, FlatList, Alert, ActivityIndicator, useWindowDimensions, Animated } from 'react-native';
 import { CameraView, useCameraPermissions } from 'expo-camera';
 import ViewShot, { captureRef } from 'react-native-view-shot';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
@@ -9,7 +9,10 @@ import { Btn, Field } from '../components/UI';
 import { useProjects } from '../store/ProjectContext';
 import { persistToApp, saveToProjectAlbum } from '../utils/media';
 import { recognizeText, DEV_BUILD_MSG } from '../utils/native';
-import { parseNameplateText } from '../data/nomenclature';
+import { parseNameplateText, guessCategory } from '../data/nomenclature';
+import * as FileSystem from 'expo-file-system/legacy';
+import * as Sharing from 'expo-sharing';
+import { flattenBlocks, assessCaptureQuality, buildScanDiagnostics } from '../data/nameplateSmart';
 import { decodeCapacity, decodeYearFromSerial, detectBrand, detectBrandFromModel, brandInfo, ageFromYear } from '../data/hvacDecode';
 import { assessCondition, classifyEquipment, refrigerantFlag, PRIORITY_META, EQUIPMENT_TYPE_OPTIONS } from '../data/serviceLife';
 import { queueForDecode } from '../utils/aidecode';
@@ -33,6 +36,7 @@ import { aiDecodeEnabled } from '../config';
  */
 export default function DecoderScreen({ navigation, route }) {
   const insets = useSafeAreaInsets();
+  const { width: winW, height: winH } = useWindowDimensions();
   const { projectId, level, spaceType, spaceNum, system } = route.params || {};
   const { projects, addPhoto } = useProjects();
 
@@ -47,14 +51,46 @@ export default function DecoderScreen({ navigation, route }) {
   const [caption, setCaption] = useState('');
   const [np, setNp] = useState({ make: '', model: '', serial: '', capacity: '', year: '' });
   const [rawOcr, setRawOcr] = useState('');
+  // ML Kit's structured blocks from the most recent scan — per-line bounding
+  // boxes. Kept so the Decode button can re-parse under a new category with
+  // full geometry, not just the flat text.
+  const [ocrBlocks, setOcrBlocks] = useState(null);
+  // Skew/tilt advisory from the most recent scan — see assessCaptureQuality
+  // in nameplateSmart.js. Surfaced as a non-blocking prompt (same pattern as
+  // CameraScreen's blur check) rather than blocking the scan outright: a
+  // tilted photo sometimes still reads fine, and the surveyor is in the
+  // best position to judge whether a retake is worth the extra thirty
+  // seconds crouched under a rooftop unit.
+  const [captureQuality, setCaptureQuality] = useState(null);
   const [decodeNotes, setDecodeNotes] = useState([]);
   const [lines, setLines] = useState([]);
   const [chooserFor, setChooserFor] = useState(null);
   const [saving, setSaving] = useState(false);
   const [projectPicker, setProjectPicker] = useState(false);
-  const [category, setCategory] = useState('hvac'); // hvac | waterheater | electrical
+  const [category, setCategory] = useState('hvac'); // hvac | waterheater | electrical | vav | backflow
+  const [categoryAuto, setCategoryAuto] = useState(true); // false once the user taps a category button themselves
   const [typeOverride, setTypeOverride] = useState(null); // manual equipment-type correction
   const [typePicker, setTypePicker] = useState(false);
+  // Full result of the most recent parseNameplateText call, kept separately
+  // from `np` so "Decode" can (re-)apply it on demand without needing
+  // another OCR pass — see runOCR/applyParsed below.
+  const [lastParsed, setLastParsed] = useState(null);
+  // Nameplates come in every proportion — a tall narrow VAV tag, a wide
+  // squat water-heater plate, a roughly square electrical label. This used
+  // to be a 3-way wide/square/tall toggle, but the frame is only a visual
+  // aiming guide (capture() always saves the full, uncropped photo — see
+  // below), so switching shapes never actually changed what got scanned.
+  // One fixed, generously-sized rectangle that comfortably fits most plates
+  // is simpler to use and one less thing to tap mid-walkthrough.
+
+  // Tap-to-focus: shows a brief reticle at the tapped point and asks the
+  // native layer for a one-shot focus+exposure pass there (see the
+  // `focusAt` patch in expo-camera). Continuous AF handles most shots fine,
+  // but up-close nameplate reads are exactly the case where it hunts
+  // instead of settling, so a manual nudge matters here more than on the
+  // regular capture screen.
+  const [focusPoint, setFocusPoint] = useState(null); // { x, y } in screen px, or null when hidden
+  const focusAnim = useRef(new Animated.Value(0)).current;
 
   // Live decode: recomputes whenever model/serial/make/category change (typed,
   // tapped from OCR, or auto-parsed). The model number gives capacity (tonnage
@@ -71,9 +107,28 @@ export default function DecoderScreen({ navigation, route }) {
       || detectBrand(`${np.model} ${np.serial}`, category)
       || detectBrandFromModel(np.model, category)
       || null;
-    const capacity = decodeCapacity(np.model, category, brand);
-    const yearInfo = decodeYearFromSerial(np.serial, brand, category);
-    const age = yearInfo ? ageFromYear(yearInfo.year) : null;
+    // VAV/backflow capacity (inlet size, heater kW, pipe size+type) isn't
+    // decoded from the model number at all — decodeCapacity correctly
+    // returns null for these categories (see hvacDecode.js). The real value
+    // is whatever parseNameplateText already read straight off the plate
+    // into np.capacity, so wrap that as a display-only "capacity" here
+    // rather than showing a false "enter model #" prompt for a field this
+    // category never uses.
+    const capacity = (category === 'vav' || category === 'backflow')
+      ? (np.capacity ? { kind: 'text', label: np.capacity, code: null, confidence: 'medium' } : null)
+      : decodeCapacity(np.model, category, brand);
+    let yearInfo = decodeYearFromSerial(np.serial, brand, category);
+    // Same reasoning for year: VAV/backflow plates print the date directly
+    // rather than encoding it in a serial (see literalDateField in
+    // nomenclature.js), so decodeYearFromSerial legitimately has nothing to
+    // decode from the serial field and returns noRule/null. If np.year
+    // already holds a value — read straight off the plate — show that
+    // instead of telling the surveyor to go re-read a plate they already
+    // read.
+    if ((!yearInfo || yearInfo.noRule || !yearInfo.year) && np.year) {
+      yearInfo = { year: parseInt(np.year, 10) || null, confidence: 'high', note: 'read directly from plate', ambiguous: false };
+    }
+    const age = yearInfo?.year ? ageFromYear(yearInfo.year) : null;
     const info = brand ? brandInfo(brand, category) : null;
     // Condition assessment — the wedge. Decoded year + equipment type -> RUL.
     // Type is auto-classified from OCR text (strongest), model prefix, then
@@ -90,24 +145,46 @@ export default function DecoderScreen({ navigation, route }) {
     setCaption('');
     setNp({ make: '', model: '', serial: '', capacity: '', year: '' });
     setRawOcr('');
+    setOcrBlocks(null);
     setDecodeNotes([]);
     setLines([]);
     setPhase('camera');
     setTypeOverride(null);
   };
 
+  const [capturing, setCapturing] = useState(false);
+
   const capture = async () => {
-    if (!cam.current) return;
-    const photo = await cam.current.takePictureAsync({ quality: 0.9 });
-    setPhotoUri(photo.uri);
-    setPhase('captured');
-    // Auto-decode: pressing the shutter in Decoder mode IS the decode request.
-    // Pass the uri explicitly — setPhotoUri hasn't flushed yet, so reading it
-    // back off state here would scan null. `auto` suppresses the
-    // low-confidence Alert: on this path the surveyor didn't ask a question,
-    // so a modal they have to dismiss on every miss is a nag. The empty
-    // fields already say it, and the manual re-scan button still speaks up.
-    runOCR(photo.uri, { auto: true });
+    if (!cam.current || capturing) return;
+    setCapturing(true);
+    try {
+      // Explicit focus-and-settle pass before the shot. Continuous AF often
+      // hasn't converged yet at the moment the shutter is tapped — especially
+      // right after repositioning the phone for a close-up nameplate read —
+      // and a picture taken mid-focus-hunt comes out soft no matter how good
+      // the OCR is downstream. (0.5, 0.35) aims at roughly the frame's
+      // center, not the whole screen's, since the plate is what needs to be
+      // sharp. Trading ~450ms of shutter lag for an actually-sharp photo.
+      try {
+        await cam.current.focusAtAsync?.(0.5, 0.35);
+      } catch {
+        // focusAtAsync is only wired up on Android builds carrying the
+        // expo-camera patch; harmless no-op everywhere else.
+      }
+      await new Promise((resolve) => setTimeout(resolve, 450));
+      const photo = await cam.current.takePictureAsync({ quality: 0.9 });
+      setPhotoUri(photo.uri);
+      setPhase('captured');
+      // Auto-decode: pressing the shutter in Decoder mode IS the decode request.
+      // Pass the uri explicitly — setPhotoUri hasn't flushed yet, so reading it
+      // back off state here would scan null. `auto` suppresses the
+      // low-confidence Alert: on this path the surveyor didn't ask a question,
+      // so a modal they have to dismiss on every miss is a nag. The empty
+      // fields already say it, and the manual re-scan button still speaks up.
+      runOCR(photo.uri, { auto: true });
+    } finally {
+      setCapturing(false);
+    }
   };
 
   const runOCR = async (uri = photoUri, { auto = false } = {}) => {
@@ -120,26 +197,188 @@ export default function DecoderScreen({ navigation, route }) {
           r.reason === 'dev-build' ? DEV_BUILD_MSG : r.reason);
         return;
       }
-      const parsed = parseNameplateText(r.text, category);
+      // Auto-pick the equipment category from the plate text itself — VAV,
+      // water heater, electrical gear, and backflow assemblies usually name
+      // themselves somewhere on the label. Only overrides the category if
+      // the user hasn't manually chosen one themselves; a deliberate tap on
+      // a category button should stick even if a later re-scan's guess
+      // disagrees; `categoryAuto` tracks that.
+      const guessedCat = guessCategory(r.text);
+      const effectiveCat = categoryAuto && guessedCat ? guessedCat : category;
+      if (categoryAuto && guessedCat && guessedCat !== category) setCategory(guessedCat);
+
+      const parsed = parseNameplateText(r.text, effectiveCat, r.blocks);
       setRawOcr(r.text);
-      setLines(r.text.split(/\n+/).map((l) => l.trim()).filter(Boolean));
-      setNp((prev) => ({
-        make: parsed.make || prev.make,
-        model: parsed.model || prev.model,
-        serial: parsed.serial || prev.serial,
-        capacity: parsed.capacity || prev.capacity,
-        year: parsed.year || prev.year,
-      }));
+      setOcrBlocks(r.blocks || null);
+      // Geometry-ordered lines (top-to-bottom, left-to-right) read far more
+      // naturally in the chooser than ML Kit's raw block order, which
+      // interleaves table columns.
+      const geomLines = r.blocks?.length ? flattenBlocks(r.blocks).map((l) => l.text) : null;
+      setLines(geomLines?.length ? geomLines : r.text.split(/\n+/).map((l) => l.trim()).filter(Boolean));
       setDecodeNotes(parsed.decodeNotes);
-      if (!auto && !parsed.make && !parsed.model && !parsed.serial) {
-        Alert.alert('Low-confidence scan', 'Text was read but no labeled fields found \u2014 check the raw values and fill in manually.');
+      setLastParsed(parsed);
+
+      // Skew check: a plate photographed at a steep angle defeats field
+      // assignment no matter how good the parsing logic is downstream — the
+      // fix there is a retake, not a smarter regex. Only worth bothering the
+      // surveyor about when the scan ALSO came back thin, so a plate that's
+      // tilted but still read fine doesn't get second-guessed.
+      const quality = r.blocks?.length ? assessCaptureQuality({ blocks: r.blocks }) : null;
+      setCaptureQuality(quality);
+      const sparse = !parsed.make && !parsed.model && !parsed.serial;
+
+      // OCR itself is never destructive: this only ever FILLS BLANK fields,
+      // same as the very first scan. Re-running OCR after repositioning the
+      // shot used to silently overwrite whatever the surveyor had already
+      // typed or corrected the moment it found ANY new value — that was the
+      // actual "re-scan deletes what I typed" bug. Fixing that meant
+      // splitting the single old button into two clearly separate actions:
+      // this one (safe, automatic, no prompt) and the explicit "Decode"
+      // button below (applies the scan on purpose, confirming first if it
+      // would change something already filled in).
+      applyParsed(parsed, { force: false });
+
+      if (sparse && quality?.skewed) {
+        Alert.alert(
+          'Photo looks tilted',
+          (quality.note || 'The plate looks tilted in this photo, which can throw off field detection.') +
+            ' Keep this scan, or retake?',
+          [
+            { text: 'Keep', style: 'cancel' },
+            { text: 'Retake', style: 'destructive', onPress: () => { setPhotoUri(null); setPhase('camera'); } },
+          ]
+        );
+      } else if (!auto && sparse) {
+        Alert.alert('Low-confidence scan', 'Text was read but no labeled fields found \u2014 check the raw values and fill in manually, or use "Insert from scan" on each field.');
       }
     } finally {
       setScanning(false);
     }
   };
 
+  /**
+   * Applies a parsed OCR result to the np fields.
+   *
+   * force=false (used by Re-Scan): only fills fields that are CURRENTLY
+   * EMPTY. Never touches a field the surveyor already has a value in,
+   * whether that value came from typing or an earlier scan — this is what
+   * makes Re-Scan safe to tap at any time.
+   *
+   * force=true (used by Decode): applies every parsed value it has,
+   * overwriting existing ones. Called directly from a Decode tap; a
+   * confirmation for any field that would actually CHANGE happens in
+   * decodeNow() before this runs, so by the time force=true fires here the
+   * user has already agreed to it.
+   */
+  const applyParsed = (parsed, { force }) => {
+    if (!parsed) return;
+    setNp((prev) => ({
+      make: force ? (parsed.make || prev.make) : (prev.make || parsed.make),
+      model: force ? (parsed.model || prev.model) : (prev.model || parsed.model),
+      serial: force ? (parsed.serial || prev.serial) : (prev.serial || parsed.serial),
+      capacity: force ? (parsed.capacity || prev.capacity) : (prev.capacity || parsed.capacity),
+      year: force ? (parsed.year || prev.year) : (prev.year || parsed.year),
+    }));
+  };
+
+  /**
+   * The "Decode" button. Re-applies the MOST RECENT scan's parsed values —
+   * no new OCR pass, no new photo needed — which matters when the surveyor
+   * just changed the category (say, from HVAC to Water Heater) and wants
+   * the fields re-read under the new category's rules. Confirms once,
+   * naming exactly which fields would change, if anything currently filled
+   * in disagrees with what the scan says; applies immediately if nothing
+   * would actually change.
+   */
+  const decodeNow = () => {
+    if (!lastParsed) {
+      Alert.alert('Nothing to decode yet', 'Scan the nameplate first (tap the shutter or Re-Scan).');
+      return;
+    }
+    // Re-parse under the CURRENT category in case it changed since the
+    // last scan — capacity decode rules differ per category (tons vs
+    // gallons vs inlet size), so a stale parse would show the wrong kind.
+    const parsed = parseNameplateText(rawOcr, category, ocrBlocks);
+    setLastParsed(parsed);
+    const changed = FIELDS
+      .map((f) => f.key)
+      .filter((k) => parsed[k] && np[k] && parsed[k] !== np[k])
+      .map((k) => FIELDS.find((f) => f.key === k).label);
+    if (changed.length === 0) {
+      applyParsed(parsed, { force: true });
+      return;
+    }
+    Alert.alert(
+      'Overwrite entered values?',
+      `The scan disagrees with what's currently in: ${changed.join(', ')}. Decode will replace ${changed.length > 1 ? 'them' : 'it'} with the scanned values.`,
+      [
+        { text: 'Cancel', style: 'cancel' },
+        { text: 'Overwrite', style: 'destructive', onPress: () => applyParsed(parsed, { force: true }) },
+      ]
+    );
+  };
+
   const setField = (key, value) => setNp((f) => ({ ...f, [key]: value }));
+
+  /**
+   * Exports the exact raw OCR result from the most recent scan — text,
+   * every line's frame, and (crucially) whatever ML Kit actually returned
+   * for cornerPoints, whether that's populated or empty. This whole
+   * decoder's geometry engine depends on cornerPoints being real on-device
+   * data, which can't be confirmed from a dev sandbox — only from an
+   * actual scan on an actual phone. When a field lands wrong, this is the
+   * one file that turns "it didn't work" into something fixable: real
+   * ground truth instead of a description of the symptom.
+   */
+  const sendScanDiagnostics = async () => {
+    if (!ocrBlocks?.length) {
+      Alert.alert('Nothing to send', 'Scan a nameplate first.');
+      return;
+    }
+    try {
+      const json = buildScanDiagnostics({ text: rawOcr, blocks: ocrBlocks }, {
+        category, make: np.make, model: np.model,
+      });
+      const path = FileSystem.cacheDirectory + `nameplate-scan-diagnostics-${Date.now()}.json`;
+      await FileSystem.writeAsStringAsync(path, json);
+      if (await Sharing.isAvailableAsync()) {
+        await Sharing.shareAsync(path, { mimeType: 'application/json', UTI: 'public.json' });
+      } else {
+        Alert.alert('Scan data saved', path);
+      }
+    } catch (e) {
+      Alert.alert('Could not export scan data', String(e));
+    }
+  };
+
+  /**
+   * Same diagnostics JSON as sendScanDiagnostics (raw OCR text, block
+   * geometry, cornerPoints) — but framed as a save, not a send. Opens the
+   * OS share sheet, which includes "Save to Files" / Drive / device
+   * storage as options, so a scan can be dropped onto the phone right now
+   * and batched up for sending all at once later, instead of going
+   * through a share/email flow after every single scan.
+   */
+  const saveScanDiagnostics = async () => {
+    if (!ocrBlocks?.length) {
+      Alert.alert('Nothing to save', 'Scan a nameplate first.');
+      return;
+    }
+    try {
+      const json = buildScanDiagnostics({ text: rawOcr, blocks: ocrBlocks }, {
+        category, make: np.make, model: np.model,
+      });
+      const path = FileSystem.cacheDirectory + `nameplate-scan-diagnostics-${Date.now()}.json`;
+      await FileSystem.writeAsStringAsync(path, json);
+      if (await Sharing.isAvailableAsync()) {
+        await Sharing.shareAsync(path, { mimeType: 'application/json', UTI: 'public.json' });
+      } else {
+        Alert.alert('Scan data saved', path);
+      }
+    } catch (e) {
+      Alert.alert('Could not save scan data', String(e));
+    }
+  };
 
   const stampFor = (targetProject) => {
     if (level && spaceType) {
@@ -215,21 +454,71 @@ export default function DecoderScreen({ navigation, route }) {
   }
 
   if (phase === 'camera') {
+    // Tall rectangle, sized generously — most of what actually gets scanned
+    // (VAV tags, breaker/panel labels, compressor data plates) reads
+    // portrait, and the frame is only ever a visual aiming guide anyway
+    // (capture() always saves the full, uncropped photo). Clamped against
+    // winH so it can't run off the bottom of a shorter phone screen.
+    const geom = {
+      w: winW * 0.7,
+      h: Math.min(winW * 0.7 * 1.6, winH * 0.58),
+    };
+
+    const handleFocusTap = (evt) => {
+      const { locationX, locationY } = evt.nativeEvent;
+      // Native side wants normalized (0..1) coordinates relative to the
+      // CameraView, which fills the whole screen here.
+      cam.current?.focusAtAsync?.(locationX / winW, locationY / winH);
+      setFocusPoint({ x: locationX, y: locationY });
+      focusAnim.setValue(1);
+      Animated.sequence([
+        Animated.delay(450),
+        Animated.timing(focusAnim, { toValue: 0, duration: 250, useNativeDriver: true }),
+      ]).start(({ finished }) => { if (finished) setFocusPoint(null); });
+    };
+
     return (
       <View style={styles.root}>
         {/* Only one CameraView may hold the camera session. Unmounting while
             unfocused lets the capture screen reacquire it on goBack() instead
             of coming back to a black preview. */}
         {isFocused ? (
-          <CameraView ref={cam} style={StyleSheet.absoluteFill} facing="back" zoom={0} />
+          <CameraView ref={cam} style={StyleSheet.absoluteFill} facing="back" zoom={0}
+            // Explicit rather than relying on expo-camera's default: 'off'
+            // here means CONTINUOUS autofocus (confusingly), 'on' means
+            // one-shot-then-lock. Written out so it doesn't silently change
+            // behavior on an expo-camera upgrade.
+            autofocus="off"
+          />
         ) : (
           <View style={[StyleSheet.absoluteFill, { backgroundColor: '#000' }]} />
         )}
-        <View pointerEvents="none" style={[styles.frame, { top: insets.top + 84 }]}>
+        {/* Tap-to-focus: continuous AF handles most shots, but up-close
+            nameplate reads are exactly the case where it hunts instead of
+            settling, so a manual nudge helps here more than it would on the
+            general capture screen. Sits above the CameraView but below the
+            frame/buttons in touch priority only in the sense that it's
+            declared first — later siblings (shutter, close) still win on
+            their own hit areas. */}
+        <Pressable style={StyleSheet.absoluteFill} onPress={handleFocusTap} />
+        <View pointerEvents="none" style={[styles.frame, {
+          top: insets.top + 84, width: geom.w, height: geom.h,
+          left: (winW - geom.w) / 2,
+        }]}>
           <Text style={styles.frameHint}>FILL FRAME WITH NAMEPLATE</Text>
         </View>
+        {focusPoint && (
+          <Animated.View
+            pointerEvents="none"
+            style={[styles.focusReticle, {
+              left: focusPoint.x - 34, top: focusPoint.y - 34,
+              opacity: focusAnim,
+              transform: [{ scale: focusAnim.interpolate({ inputRange: [0, 1], outputRange: [1.15, 1] }) }],
+            }]}
+          />
+        )}
         <View style={[styles.shutterRow, { paddingBottom: insets.bottom + 40 }]}>
-          <Pressable onPress={capture} style={styles.shutterOuter}>
+          <Pressable onPress={capture} disabled={capturing} style={[styles.shutterOuter, capturing && { opacity: 0.45 }]}>
             <View style={styles.shutterInner} />
           </Pressable>
         </View>
@@ -261,31 +550,54 @@ export default function DecoderScreen({ navigation, route }) {
                 )}
               </ViewShot>
 
-              {/* Manual re-scan. The shutter already auto-decodes; this is for
-                  a second attempt after repositioning or wiping the plate.
-                  Must be wrapped — a bare `onPress={runOCR}` would hand the
-                  press event to the uri parameter. */}
-              <Pressable style={styles.ocrBtn} onPress={() => runOCR()} disabled={scanning}>
-                <Text style={styles.ocrBtnText}>
-                  {scanning ? 'READING TAG\u2026' : '\ud83d\udd0e RE-SCAN TEXT (OCR) + DECODE'}
-                </Text>
-                {scanning && <ActivityIndicator color="#04121F" style={{ marginLeft: 8 }} />}
-              </Pressable>
+              {/* Two separate, honestly-labeled actions, where there used to
+                  be one that quietly did both:
+                  RE-SCAN reads the photo again and only fills fields that
+                  are still blank — always safe, never overwrites anything
+                  you've typed or corrected.
+                  DECODE (re-)applies the last scan's parsed values to the
+                  fields on purpose, and asks first if that would actually
+                  change something already filled in. That confirm is what's
+                  missing before: the old single button applied on every tap
+                  with no warning, which is what silently wiped out manual
+                  corrections. */}
+              <View style={{ flexDirection: 'row', gap: 8, marginTop: 12, marginBottom: 4 }}>
+                <Pressable style={[styles.ocrBtn, { flex: 1, marginTop: 0 }]} onPress={() => runOCR()} disabled={scanning}>
+                  <Text style={styles.ocrBtnText}>
+                    {scanning ? 'READING\u2026' : '\ud83d\udd0e RE-SCAN'}
+                  </Text>
+                  {scanning && <ActivityIndicator color="#04121F" style={{ marginLeft: 8 }} />}
+                </Pressable>
+                <Pressable
+                  style={[styles.ocrBtn, styles.decodeBtn, { flex: 1, marginTop: 0 }]}
+                  onPress={decodeNow}
+                  disabled={scanning}
+                >
+                  <Text style={[styles.ocrBtnText, styles.decodeBtnText]}>{'\u2699 DECODE'}</Text>
+                </Pressable>
+              </View>
+              <Text style={styles.ocrHint}>Re-Scan only fills blank fields. Decode re-applies the scan on purpose \u2014 it'll ask first if that would change something you've entered.</Text>
 
               {decodeNotes.map((n, i) => (
                 <Text key={i} style={styles.decodeNote}>{'\u25c8 ' + n}</Text>
               ))}
 
               {/* Unit type — controls which decode rules apply. The same brand
-                  can encode date/capacity differently across equipment types. */}
+                  can encode date/capacity differently across equipment types.
+                  Auto-picked from the scan (see runOCR); tapping one here is
+                  a deliberate override that sticks through later re-scans. */}
               <View style={styles.catRow}>
-                {[['hvac', 'HVAC / AC'], ['waterheater', 'Water Heater'], ['electrical', 'Electrical']].map(([id, lbl]) => (
-                  <Pressable key={id} onPress={() => setCategory(id)}
+                {[['hvac', 'HVAC / AC'], ['waterheater', 'Water Htr'], ['electrical', 'Electrical'],
+                  ['vav', 'VAV / Fan'], ['backflow', 'Backflow']].map(([id, lbl]) => (
+                  <Pressable key={id} onPress={() => { setCategory(id); setCategoryAuto(false); }}
                     style={[styles.catBtn, category === id && styles.catBtnOn]}>
                     <Text style={[styles.catBtnText, category === id && styles.catBtnTextOn]}>{lbl}</Text>
                   </Pressable>
                 ))}
               </View>
+              {categoryAuto && rawOcr ? (
+                <Text style={styles.autoTag}>{'\u26a1 Auto-detected from scan \u2014 tap to override'}</Text>
+              ) : null}
 
               {/* Live decode result — the core of the tool. Recomputes as the
                   model/serial fields change. Shows capacity + mfg year/age with
@@ -295,15 +607,27 @@ export default function DecoderScreen({ navigation, route }) {
                   <Text style={styles.liveTitle}>{'\u2699 DECODED' + (live.brand ? '  \u00b7  ' + live.brand.toUpperCase() : '')}</Text>
                   <View style={styles.liveRow}>
                     <View style={styles.liveCell}>
-                      <Text style={styles.liveLabel}>{category === 'waterheater' ? 'CAPACITY' : category === 'electrical' ? 'RATING' : 'TONNAGE'}</Text>
+                      <Text style={styles.liveLabel}>
+                        {category === 'waterheater' ? 'CAPACITY'
+                          : category === 'electrical' ? 'RATING'
+                          : category === 'vav' ? 'INLET / HEATER'
+                          : category === 'backflow' ? 'SIZE / TYPE'
+                          : 'TONNAGE'}
+                      </Text>
                       {live.capacity ? (
                         <>
                           <Text style={styles.liveValue}>{live.capacity.label.split(' (')[0]}</Text>
-                          <Text style={styles.liveSub}>{`code ${live.capacity.code}`}</Text>
+                          {live.capacity.code ? (
+                            <Text style={styles.liveSub}>{`code ${live.capacity.code}`}</Text>
+                          ) : (
+                            <Text style={styles.liveSub}>read from plate</Text>
+                          )}
                           <ConfidenceTag level={live.capacity.confidence} />
                         </>
                       ) : (
-                        <Text style={styles.liveNone}>enter model #</Text>
+                        <Text style={styles.liveNone}>
+                          {category === 'vav' || category === 'backflow' ? 'enter size / rating' : 'enter model #'}
+                        </Text>
                       )}
                     </View>
                     <View style={styles.liveDivider} />
@@ -389,7 +713,17 @@ export default function DecoderScreen({ navigation, route }) {
               )}
 
               {rawOcr ? (
-                <Text style={styles.npHint}>{'Decoded values are estimates \u2014 confirm each field before saving.'}</Text>
+                <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <Text style={styles.npHint}>{'Decoded values are estimates \u2014 confirm each field before saving.'}</Text>
+                  <View style={{ flexDirection: 'row', gap: 16 }}>
+                    <Pressable onPress={saveScanDiagnostics} hitSlop={8}>
+                      <Text style={styles.insertLink}>Save scan data</Text>
+                    </Pressable>
+                    <Pressable onPress={sendScanDiagnostics} hitSlop={8}>
+                      <Text style={styles.insertLink}>Send scan data</Text>
+                    </Pressable>
+                  </View>
+                </View>
               ) : (
                 <Text style={styles.npHint}>Scan to auto-fill, or type the model & serial to decode.</Text>
               )}
@@ -433,9 +767,10 @@ export default function DecoderScreen({ navigation, route }) {
         />
       </View>
 
-      {/* Line chooser: pick which detected line fills the active field.
-          A correction aid on top of parseNameplateText's auto-fill \u2014
-          useful when a brand isn't in the dictionary or OCR is noisy. */}
+      {/* Line chooser: pick which detected value fills the active field.
+          Best guesses first — the smart extractor's ranked candidates for
+          THIS field (with the reason each one is plausible), then every
+          scanned line in reading order as the catch-all. One tap either way. */}
       <Modal visible={!!chooserFor} animationType="slide" transparent>
         <View style={styles.modalScrim}>
           <View style={[styles.modalSheet, { paddingBottom: insets.bottom + 16 }]}>
@@ -443,13 +778,38 @@ export default function DecoderScreen({ navigation, route }) {
               {'Insert into ' + (FIELDS.find((f) => f.key === chooserFor)?.label || '')}
             </Text>
             <FlatList
-              data={lines}
-              keyExtractor={(l, i) => `${i}-${l}`}
-              renderItem={({ item }) => (
-                <Pressable style={styles.modalRow} onPress={() => { setField(chooserFor, item); setChooserFor(null); }}>
-                  <Text style={styles.modalRowText}>{item}</Text>
-                </Pressable>
-              )}
+              data={(() => {
+                const sugg = (lastParsed?.candidates?.[chooserFor] || []).map((c) => ({
+                  kind: 'sugg', value: c.value, why: c.why?.[0] || null,
+                }));
+                const suggKeys = new Set(sugg.map((s) => s.value.toUpperCase().replace(/\s+/g, '')));
+                const rest = lines
+                  .filter((l) => !suggKeys.has(l.toUpperCase().replace(/\s+/g, '')))
+                  .map((l) => ({ kind: 'line', value: l }));
+                const items = [];
+                if (sugg.length) items.push({ kind: 'hdr', value: 'BEST GUESSES' }, ...sugg);
+                if (rest.length) items.push({ kind: 'hdr', value: sugg.length ? 'ALL SCANNED LINES' : 'SCANNED LINES' }, ...rest);
+                return items;
+              })()}
+              keyExtractor={(it, i) => `${i}-${it.kind}-${it.value}`}
+              renderItem={({ item }) => {
+                if (item.kind === 'hdr') {
+                  return <Text style={styles.chooserHdr}>{item.value}</Text>;
+                }
+                return (
+                  <Pressable
+                    style={styles.modalRow}
+                    onPress={() => { setField(chooserFor, item.value); setChooserFor(null); }}
+                  >
+                    <Text style={[styles.modalRowText, item.kind === 'sugg' && { color: color.accent }]}>
+                      {item.value}
+                    </Text>
+                    {item.kind === 'sugg' && item.why ? (
+                      <Text style={styles.modalRowSub}>{item.why}</Text>
+                    ) : null}
+                  </Pressable>
+                );
+              }}
             />
             <Pressable style={styles.modalClose} onPress={() => setChooserFor(null)}>
               <Text style={styles.modalCloseText}>CANCEL</Text>
@@ -538,14 +898,15 @@ const FIELDS = [
 ];
 
 const styles = StyleSheet.create({
-  catRow: { flexDirection: 'row', gap: 8, marginBottom: 10 },
+  catRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginBottom: 6 },
   catBtn: {
-    flex: 1, height: 38, borderRadius: 9, alignItems: 'center', justifyContent: 'center',
+    width: '31.5%', height: 38, borderRadius: 9, alignItems: 'center', justifyContent: 'center',
     backgroundColor: color.cardFill, borderWidth: 1, borderColor: color.cardBorder,
   },
   catBtnOn: { borderColor: color.accent, backgroundColor: 'rgba(91,141,239,.12)' },
-  catBtnText: { ...font(700, 11, { mono: true, ls: 1.2 }), color: color.text45, textTransform: 'uppercase' },
+  catBtnText: { ...font(700, 10, { mono: true, ls: 0.8 }), color: color.text45, textTransform: 'uppercase' },
   catBtnTextOn: { color: color.accent },
+  autoTag: { ...font(600, 11), color: color.accent, marginBottom: 10 },
 
   liveCard: {
     backgroundColor: color.cardFill, borderWidth: 1, borderColor: color.accent,
@@ -572,11 +933,17 @@ const styles = StyleSheet.create({
   center: { alignItems: 'center', justifyContent: 'center', gap: 16, padding: 30 },
   permText: { color: color.textPrimary, textAlign: 'center', fontSize: 15 },
 
-  // Wider + taller: most nameplates are broad plates, and the old 80%x30%
-  // box forced the user to stand too far back to fill it.
+  // Geometry (width/height/left) is computed once and passed inline; this
+  // only carries the shared visual styling.
   frame: {
-    position: 'absolute', left: '5%', right: '5%', height: '42%',
+    position: 'absolute',
     borderWidth: 2, borderColor: color.accent, borderRadius: 12, alignItems: 'center',
+  },
+  // Tap-to-focus reticle: a short-lived ring at the tapped point, faded in
+  // via focusAnim and cleared once the fade-out finishes (see handleFocusTap).
+  focusReticle: {
+    position: 'absolute', width: 68, height: 68, borderRadius: 34,
+    borderWidth: 1.5, borderColor: color.accent,
   },
   // Sits ABOVE the frame instead of straddling the top border — the old
   // marginTop:-12 dropped the label right on top of the line.
@@ -606,6 +973,9 @@ const styles = StyleSheet.create({
     alignItems: 'center', justifyContent: 'center', marginTop: 12, marginBottom: 8,
   },
   ocrBtnText: { ...font(700, 13), color: '#04121F' },
+  decodeBtn: { backgroundColor: color.cardFill, borderWidth: 1, borderColor: color.accent },
+  decodeBtnText: { color: color.accent },
+  ocrHint: { color: color.text45, fontSize: 10, lineHeight: 14, marginBottom: 10 },
   decodeNote: { color: '#3fb950', fontSize: 11, marginBottom: 4 },
   altBanner: {
     marginTop: 10, padding: 8, borderRadius: 8,
@@ -629,6 +999,10 @@ const styles = StyleSheet.create({
   modalRow: { paddingVertical: 15, borderBottomWidth: 1, borderBottomColor: color.cardBorder },
   modalRowText: { color: color.textPrimary, fontSize: 15, fontWeight: '600' },
   modalRowSub: { color: color.text45, fontSize: 11, marginTop: 2 },
+  chooserHdr: {
+    ...font(700, 10, { mono: true, ls: 1.2 }), color: color.text45,
+    textTransform: 'uppercase', marginTop: 12, marginBottom: 2,
+  },
   modalHint: { color: color.text45, fontSize: 12, lineHeight: 17, marginBottom: 10 },
   modalClose: { paddingVertical: 16, alignItems: 'center' },
   modalCloseText: { ...font(700, 11, { mono: true, ls: 1.2 }), color: color.text45, textTransform: 'uppercase' },

@@ -9,6 +9,7 @@ import { checkPhotoQuality } from '../utils/quality';
 import { persistToApp, saveToProjectAlbum } from '../utils/media';
 import { recognizeText, startDictation, stopDictation, DEV_BUILD_MSG } from '../utils/native';
 import { parseNameplateText } from '../data/nomenclature';
+import { assessCaptureQuality } from '../data/nameplateSmart';
 import { queueForDecode } from '../utils/aidecode';
 import { aiDecodeEnabled } from '../config';
 
@@ -42,17 +43,38 @@ export default function ReviewScreen({ route, navigation }) {
           r.reason === 'dev-build' ? DEV_BUILD_MSG : r.reason);
         return;
       }
-      const parsed = parseNameplateText(r.text);
+      // `r.blocks` (ML Kit's per-line bounding boxes) is passed through here
+      // now — this screen's nameplate scan used to run text-only, which
+      // meant it never got the geometry-aware table-layout pairing or the
+      // rotation correction that DecoderScreen already had. Same pipeline,
+      // same fix, second entry point.
+      const parsed = parseNameplateText(r.text, undefined, r.blocks);
       setRawOcr(r.text);
+      // Only fills fields that are still BLANK — this screen has no
+      // separate Re-Scan/Decode split like DecoderScreen (there's no scan-
+      // lines UI here to support a "force re-apply" action), but re-running
+      // OCR silently overwriting a field the surveyor had already typed or
+      // corrected was the same real bug either way. Non-destructive by
+      // default is the safe behavior for the one button this screen has.
       setNp((prev) => ({
-        make: parsed.make || prev.make,
-        model: parsed.model || prev.model,
-        serial: parsed.serial || prev.serial,
-        capacity: parsed.capacity || prev.capacity,
-        year: parsed.year || prev.year,
+        make: prev.make || parsed.make,
+        model: prev.model || parsed.model,
+        serial: prev.serial || parsed.serial,
+        capacity: prev.capacity || parsed.capacity,
+        year: prev.year || parsed.year,
       }));
       setDecodeNotes(parsed.decodeNotes);
-      if (!parsed.make && !parsed.model && !parsed.serial) {
+      const sparse = !parsed.make && !parsed.model && !parsed.serial;
+      const cq = r.blocks?.length ? assessCaptureQuality({ blocks: r.blocks }) : null;
+      if (sparse && cq?.skewed) {
+        Alert.alert('Photo looks tilted',
+          (cq.note || 'The plate looks tilted in this photo, which can throw off field detection.'),
+          [
+            { text: 'Fill in manually', style: 'cancel' },
+            { text: 'Retake', style: 'destructive', onPress: () => navigation.goBack() },
+          ]
+        );
+      } else if (sparse) {
         Alert.alert('Low-confidence scan', 'Text was read but no labeled fields found — check the raw values and fill in manually.');
       }
     } finally {

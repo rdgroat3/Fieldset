@@ -56,7 +56,7 @@
 //   coin flip. See hvacDecode.js.
 // ─────────────────────────────────────────────────────────────────────────
 
-export const DECODE_DB_VERSION = '2026.07.2';
+export const DECODE_DB_VERSION = '2026.07.3';
 
 export const CATEGORIES = {
   hvac: 'HVAC / Refrigeration',
@@ -72,6 +72,16 @@ export const HVAC_CAPACITY_CODES = {
   '090': 7.5, '102': 8.5, '120': 10, '150': 12.5, '180': 15, '210': 17.5,
   '240': 20, '300': 25, '360': 30, '420': 35, '450': 37.5, '480': 40,
   '540': 45, '600': 50,
+  // "+1" variants: some manufacturers' commercial/legacy SKUs use one more
+  // than the round code for the same nominal tonnage rather than the round
+  // number itself — confirmed against manufacturer spec sheets, not a
+  // rounding guess:
+  //   ICP CHS091/121 (commercial split heat pump spec sheet, position-by-
+  //     position nomenclature table: 091=7.5 tons, 121=10 tons)
+  //   Bryant/Payne FB4C061 (fan coil product data — 061 is the top of the
+  //     "018 thru 061" size range that's 060 in other FB4C literature; same
+  //     5-ton class, later SKU revision)
+  '061': 5, '091': 7.5, '121': 10,
 };
 
 // Two-digit capacity codes (tens of kBTU/h) used mid-model by several brands.
@@ -81,7 +91,14 @@ export const HVAC_CAPACITY_CODES_2 = {
 
 // Common residential/commercial water-heater tank sizes (US gallons), used to
 // pull capacity out of a model number with reasonable confidence.
-export const WH_GALLON_SIZES = [20, 28, 30, 38, 40, 47, 48, 50, 55, 65, 66, 74, 75, 80, 98, 100, 119];
+// 6 confirmed directly off a field nameplate (A.O. Smith EJC 6 200 point-of-
+// use heater, "CAPACITY US GAL: 6.0" printed on the plate) — the table
+// previously started at 20, so every small point-of-use/lavatory heater
+// (break rooms, remote restrooms — a common MEP survey find) decoded to
+// nothing. Other small POU sizes (2.5, 10, 15, 19 gal) are common on this
+// model line too but aren't added here without a plate to confirm against;
+// add them as they turn up in the field rather than guessing the set.
+export const WH_GALLON_SIZES = [6, 20, 28, 30, 38, 40, 47, 48, 50, 55, 65, 66, 74, 75, 80, 98, 100, 119];
 
 // Bradford White 20-year year-letter cycle (skips I,O,Q,R,U,V). A = 1984/2004…
 export const BW_YEAR_LETTERS = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'J', 'K', 'L', 'M', 'N', 'P', 'S', 'T', 'W', 'X', 'Y', 'Z'];
@@ -117,22 +134,117 @@ export const DECODE_DB = [
     name: 'Carrier',
     category: 'hvac',
     family: 'Carrier Global',
-    aliases: ['carrier', 'bryant', 'payne', 'day & night', 'day and night'],
+    // 'cac/bdp' etc.: many Bryant/Payne-family fan coils and air handlers are
+    // stamped "CAC/BDP" (Carrier Air Conditioning / Bryant Day & Payne — the
+    // corporate manufacturing designation) instead of a retail brand word.
+    // Confirmed against a real fan-coil nameplate reading "CAC/BDP" with the
+    // exact same Indianapolis address ("7310 W. Morris St") that appears on
+    // this brand's own Carrier-branded units — before this alias, that
+    // nameplate matched NO brand at all: no text alias, no model prefix.
+    aliases: ['carrier', 'bryant', 'payne', 'day & night', 'day and night',
+      'cac/bdp', 'cac-bdp', 'cac bdp'],
     // Carrier product families: 24=AC, 25=HP, 38=condenser, 40=fan coil,
     // 48=packaged gas/elec, 50=packaged elec, 58/59=furnace.
-    modelPrefixes: [/^(?:24|25|38|40|48|50|58|59)[A-Z]{2,3}/],
+    // FB4C = Bryant/Payne "Comfort" fan coil (see capacityRules below) — a
+    // completely different naming convention from the numeric-family codes,
+    // which is why it needs its own prefix entry rather than fitting the
+    // pattern above.
+    //
+    // The trailing `\d` is load-bearing and was missing. `^(?:24|...)[A-Z]{2,3}`
+    // with nothing after it matches "50HZ" and "24VAC" — a family code plus
+    // two or three letters and then end-of-token. Both are ordinary lines on
+    // any Carrier plate (line frequency; control-circuit voltage), and the
+    // measured result was that a plate cropped to its ratings table returned
+    // "50HZ" as the MODEL, scored above the auto-assign threshold.
+    //
+    // Every real Carrier model in this family carries a numeric size/series
+    // field immediately after the letter group — 48TCED08…, 38MURAQ24AA3,
+    // 24ACC636A003, 25HCB636A003. Requiring at least one digit there costs
+    // nothing in recall and removes the entire class of two-letter rating
+    // suffixes in one edit. The isRatingToken filter in nameplateSmart.js
+    // catches these independently; both exist because a prefix this
+    // permissive would keep finding new ways to be wrong.
+    modelPrefixes: [/^(?:24|25|38|40|48|50|58|59)[A-Z]{2,4}\d/, /^FB4C[A-Z]{0,2}\d/],
     capacityRules: [
+      // ── Carrier 48TC WeatherMaker commercial packaged rooftop ──
+      //
+      // Ordered FIRST because it must win over carrier-cap2 below, and
+      // because getting this wrong is expensive: without it, a 20-ton
+      // 48TCDD24A1G6 fell through to the generic 2-digit scan, which read
+      // the "24" against the standard kBTU/12 grid and reported 2 TONS on
+      // the condition report. Off by a factor of ten, presented with no
+      // hedge.
+      //
+      // The 48TC size field is NOT the kBTU/12 grid — it is a platform-
+      // local index. Both halves of the range are transcribed directly
+      // from Carrier's own Model Number Nomenclature pages:
+      //
+      //   3-15 ton platform (Form 48TC-04-16-03PD):
+      //     04=3  05=4  06=5  07=6  08=7.5  09=8.5  12=10  14=12.5  16=15
+      //   15-27.5 ton platform (Product Data C09248, form 48TC-16PD):
+      //     17=15  20=17.5  24=20  28=25  30=27.5
+      //
+      // Corroborated independently: Carrier's 48TC*D09 service literature
+      // is titled 8.5 ton, and the C09248 AHRI cooling rating table lists
+      // sizes 17/20/24/28 at 15/17.5/20/25 nominal tons.
+      //
+      // 16 and 17 both map to 15 tons. That is not a typo — they are the
+      // top of the small platform and the bottom of the large one, two
+      // different cabinets at the same nominal capacity.
+      //
+      // NOTE: size 30 is printed as 27.5 tons on the nomenclature page and
+      // in the "COOLING CAPACITIES ... 27.5 TONS 48TC*D30" table, but as
+      // 30 tons in that same document's AHRI summary table. Two of three
+      // say 27.5, so 27.5 is used. Anything decoding to a 30 should be
+      // eyeballed against the plate.
+      //
+      // Position: 48TC + heat-size letter + refrig-system letter + NN.
+      // 48TCED08... -> E (medium gas heat), D (2-stage cooling), 08.
+      //
+      // Deliberately NOT extended to the 50TC electric-cooling sibling.
+      // It is very likely the same scale, but "very likely" is how wrong
+      // numbers get into reports — no Carrier 50TC nomenclature page was
+      // checked, so 50TC stays undecoded until one is.
+      {
+        id: 'carrier-48tc-size',
+        test: /^48TC[A-Z]{2}(\d{2})/,
+        map: { table: 1 },
+        table: {
+          '04': 3, '05': 4, '06': 5, '07': 6, '08': 7.5, '09': 8.5,
+          '12': 10, '14': 12.5, '16': 15,
+          '17': 15, '20': 17.5, '24': 20, '28': 25, '30': 27.5,
+        },
+        confidence: 'high',
+        note: 'Carrier 48TC WeatherMaker nominal cooling size code (platform index, not kBTU/12)',
+        examples: [['48TCED08A2A5-0A0A0', 7.5], ['48TCDD24A1G6-0A0A0', 20], ['48TCAD09A2A6', 8.5]],
+      },
       { id: 'carrier-cap2', test: /^(?:24|25|38|48|50)[A-Z]{2,3}\d?(\d{2})[A-Z0-9]/, map: { tons2: 1 },
         confidence: 'high', note: 'Carrier capacity field (2-digit kBTU/h)',
         examples: [['24ACC636A003', 3], ['24ABB330A003', 2.5]] },
+      // FB4CNP061 -> "061" nominal size code, verified against Bryant/Payne
+      // FB4C fan-coil product data (018 thru 061 size range; the standard
+      // 018/024/030/036/042/048/060 = 1.5-5 ton grid, with 061 as the top-
+      // of-line "+1" SKU for the same 5-ton class).
+      { id: 'carrier-fb4c-cap3', test: /^FB4C[A-Z]{2}(\d{3})/, map: { tons3: 1 },
+        confidence: 'high', note: 'Bryant/Payne FB4C fan coil nominal size code',
+        examples: [['FB4CNP018L00', 1.5], ['FB4CNP036L00', 3], ['FB4CNP061', 5]] },
     ],
     sources: [
       'https://texastempmasters.com/blog/carrier-serial-number-age',
       'https://www.building-center.org/carrier-hvac-age/',
     ],
     serialRules: [
-      { id: 'carrier-wwyy', test: /^(\d{2})(\d{2})/, map: { week: 1, yearShort: 2 },
-        confidence: 'high', note: 'WWYY (week+year)',
+      // Full-shape anchored: WWYY + one plant letter + 5 digits (10 chars
+      // total), matching both declared examples exactly. The prior version
+      // only tested the leading 4 digits with no length or tail
+      // constraint, so ANY digit-leading noise token (a pressure spec, a
+      // stray timestamp fragment, price text) would pass and "decode" to
+      // a plausible-looking year — that's a false-positive generator, not
+      // real evidence, and it was outscoring genuine geometry-paired
+      // serials in practice. Real Carrier serials have a specific shape;
+      // require it.
+      { id: 'carrier-wwyy', test: /^(\d{2})(\d{2})[A-Z]\d{5}$/, map: { week: 1, yearShort: 2 },
+        confidence: 'high', note: 'WWYY (week+year) + plant letter + 5-digit sequence',
         examples: [['3216E54321', { year: 2016, week: 32 }], ['2714X12345', { year: 2014, week: 27 }]] },
     ],
   },
@@ -145,7 +257,25 @@ export const DECODE_DB = [
     family: 'Carrier Global',
     aliases: ['international comfort products', 'international comfort', 'icp', 'heil',
       'heil-quaker', 'tempstar', 'comfortmaker', 'arcoaire', 'keeprite', 'keep rite'],
-    modelPrefixes: [/^(?:N4A|N4H|NXA|NXH|H4A|H4H|T4A|T4H|C4A|C4H|R4A|R4H|PA[BCD]|PG[BCD]|PH[BCD])/],
+    // CHS = commercial split-system heat pump (see capacityRules). RCS/RAS/
+    // RGH/RAH/RHH are commercial rooftop lines confirmed present in the field
+    // (an accessory-data plate photographed alongside a CHS unit references
+    // "RCS/RAS072-150" and "RGH/RAH036-304"/"RHH036-155" by name) — added
+    // here for brand detection even though their capacity-field convention
+    // hasn't been independently verified yet, so no capacityRule references
+    // them. Confirm against a real nameplate before trusting a tonnage read
+    // on one of these.
+    modelPrefixes: [/^(?:N4A|N4H|NXA|NXH|H4A|H4H|T4A|T4H|C4A|C4H|R4A|R4H|PA[BCD]|PG[BCD]|PH[BCD]|CHS|RCS|RAS|RGH|RAH|RHH)/],
+    capacityRules: [
+      // CHS072/091/121HAA0A00A -- verified position-by-position against the
+      // manufacturer spec sheet's own "MODEL NOMENCLATURE" table (position
+      // 4-6 = nominal cooling capacity, direct lookup not a /12 formula:
+      // 072=6, 091=7.5, 121=10 tons). Source: ICP CHS commercial split-
+      // system heat pump product data, form 506 14 3401 02.
+      { id: 'icp-chs-cap3', test: /^CHS(\d{3})/, map: { tons3: 1 },
+        confidence: 'high', note: 'ICP CHS commercial split-system heat pump nominal capacity',
+        examples: [['CHS072HAA0A00A', 6], ['CHS091HAA0A00A', 7.5], ['CHS121HAA0A00A', 10]] },
+    ],
     sources: ['https://www.shareddocs.com/hvac/docs/1011/Public/0A/ICP_Nomenclature.pdf'],
     serialRules: [
       { id: 'icp-letter-wwyy', test: /^[A-Z](\d{2})(\d{2})/, map: { week: 1, yearShort: 2 },
@@ -158,7 +288,14 @@ export const DECODE_DB = [
     category: 'hvac',
     family: 'Trane Technologies',
     aliases: ['trane', 'american standard', 'ameristar', 'ingersoll rand', 'ingersoll-rand'],
-    modelPrefixes: [/^[24]T[A-Z]{2}\d/, /^T[TW][ABDEHRSX]\d/, /^4A[67][A-Z]/],
+    // [234]A[67]A\d: the older "Allegiance" split-system A/C and heat-pump
+    // line (2A6A/2A7A/3A6A/3A7A/4A6A/4A7A — tonnage-class digit, A/HP
+    // indicator, generation digit, A, then the capacity/voltage run).
+    // Confirmed from a real field nameplate ("2A7A1024A1000AA", American
+    // Standard/Trane "Allegiance 11", MFR DATE 12/2004) that matched NONE
+    // of the three prefixes below — all three assume a newer model shape
+    // starting with T or a 4A6/4A7 pair, not this older 2-digit-led family.
+    modelPrefixes: [/^[24]T[A-Z]{2}\d/, /^T[TW][ABDEHRSX]\d/, /^4A[67][A-Z]/, /^[234]A[67]A\d/],
     capacityRules: [
       { id: 'trane-cap3', test: /^\d[A-Z]{3}\d(\d{3})/, map: { tons3: 1 },
         confidence: 'high', note: 'Trane capacity field (kBTU/h)',
@@ -238,7 +375,11 @@ export const DECODE_DB = [
     family: 'Daikin Industries',
     aliases: ['goodman', 'amana', 'daikin', 'janitrol', 'quietflex'],
     modelPrefixes: [
-      /^(?:GSX|GSZ|GSH|SSX|SSZ|ASX|ASZ|DSX|DSZ|VSX|VSZ)[A-Z]?\d/,
+      // GSC/GSZ/GSX etc.: Goodman's single-stage split AC/HP condenser
+      // families (GSC13/GSC16 = 13/16 SEER single-stage AC). GSC was
+      // missing here — confirmed from a real field nameplate
+      // ("GSC130361GB") that otherwise matched no Goodman prefix at all.
+      /^(?:GSX|GSZ|GSH|GSC|SSX|SSZ|ASX|ASZ|DSX|DSZ|VSX|VSZ)[A-Z]?\d/,
       /^(?:GMEC|GMVC|GMSS|GMES|GCES|GCVC|CAPF|CAPT|CHPF|ARUF|AMST|AMVT|ASPT)/,
     ],
     capacityRules: [
@@ -251,9 +392,26 @@ export const DECODE_DB = [
       'https://www.electrical-forensics.com/HVAC/AirConditionerDateCodes.html',
     ],
     serialRules: [
-      { id: 'goodman-yymm', test: /^(\d{2})(\d{2})/, map: { year2000: 1, monthNum: 2 },
-        confidence: 'high', note: 'YYMM (year+month)',
+      // Modern Goodman/Amana format is confirmed 10 characters, all-digit,
+      // by multiple independent sources (both DB examples match exactly).
+      // The prior version only tested the leading 4 digits with no length
+      // or tail constraint, letting any digit-leading noise token
+      // "decode" to a plausible year — the same false-positive shape as
+      // the Carrier bug this was fixed alongside. Older/legacy Goodman
+      // formats (Julian day, letter-prefixed) are real but different
+      // schemes this rule was never meant to cover; a genuinely
+      // off-format serial should fall through to the low-confidence
+      // fallback rather than be force-fit here.
+      { id: 'goodman-yymm', test: /^(\d{2})(\d{2})\d{6}$/, map: { year2000: 1, monthNum: 2 },
+        confidence: 'high', note: 'YYMM (year+month), 10-digit modern format',
         examples: [['0606111539', { year: 2006, month: 6 }], ['1806123456', { year: 2018, month: 6 }]] },
+      // Loose fallback for legacy/off-length Goodman serials (Julian day
+      // codes, letter-prefixed plant codes, etc). Deliberately 'low' so
+      // it never outranks the anchored rule above or a labeled/geometry
+      // pick — an honest low-confidence guess, not a false-high claim.
+      { id: 'goodman-yymm-loose', test: /^(\d{2})(\d{2})/, map: { year2000: 1, monthNum: 2 },
+        confidence: 'low', note: 'YYMM assumed - serial length matches no known modern Goodman style, confirm against the plate',
+        examples: [] },
     ],
   },
   {
@@ -279,7 +437,12 @@ export const DECODE_DB = [
     category: 'hvac',
     family: 'Lennox International',
     aliases: ['lennox'],
-    modelPrefixes: [/^(?:ML\d{2}|XC\d{2}|XP\d{2}|EL\d{3}|SL\d{2}|SLP\d{2}|CBX\d{2}|CBA\d{2})/],
+    // \d{2}HPX: Lennox's single-stage heat pump line (13HPX/14HPX/16HPX —
+    // the leading number is the SEER/HSPF tier, not a brand-unrelated
+    // digit). Confirmed from two real field nameplates ("13HPX-048-230-18",
+    // "14HPX-060-230-19") that otherwise matched no Lennox prefix at all —
+    // every existing entry here assumed the model starts with a LETTER.
+    modelPrefixes: [/^(?:ML\d{2}|XC\d{2}|XP\d{2}|EL\d{3}|SL\d{2}|SLP\d{2}|CBX\d{2}|CBA\d{2}|\d{2}HPX)/],
     capacityRules: [
       { id: 'lennox-cap3', test: /-(\d{3})-/, map: { tons3: 1 },
         confidence: 'high', note: 'Lennox hyphen-delimited capacity field (kBTU/h)',
@@ -456,6 +619,14 @@ export const DECODE_DB = [
   // the SYSTEM's nominal tonnage. The capacity rule is rated accordingly.
   {
     name: 'Copeland',
+        // A COMPONENT brand, not a unit brand. Compressors carry their own
+    // nameplate inside the cabinet, and a surveyor photographing a
+    // condensing unit routinely captures both in one frame. The compressor
+    // label must never win brand detection over the unit label — it selects
+    // the wrong serial rules and reports the compressor's build date as the
+    // equipment's manufacture date, which is often years apart and always
+    // the wrong number for a service-life assessment.
+    componentBrand: true,
     category: 'hvac',
     family: 'Copeland (Emerson)',
     aliases: ['copeland', 'copeland scroll', 'emerson climate'],
@@ -481,6 +652,14 @@ export const DECODE_DB = [
   },
   {
     name: 'Bristol Compressors',
+        // A COMPONENT brand, not a unit brand. Compressors carry their own
+    // nameplate inside the cabinet, and a surveyor photographing a
+    // condensing unit routinely captures both in one frame. The compressor
+    // label must never win brand detection over the unit label — it selects
+    // the wrong serial rules and reports the compressor's build date as the
+    // equipment's manufacture date, which is often years apart and always
+    // the wrong number for a service-life assessment.
+    componentBrand: true,
     category: 'hvac',
     family: 'Bristol Compressors',
     aliases: ['bristol', 'bristol compressors'],
@@ -494,6 +673,14 @@ export const DECODE_DB = [
   },
   {
     name: 'Tecumseh',
+        // A COMPONENT brand, not a unit brand. Compressors carry their own
+    // nameplate inside the cabinet, and a surveyor photographing a
+    // condensing unit routinely captures both in one frame. The compressor
+    // label must never win brand detection over the unit label — it selects
+    // the wrong serial rules and reports the compressor's build date as the
+    // equipment's manufacture date, which is often years apart and always
+    // the wrong number for a service-life assessment.
+    componentBrand: true,
     category: 'hvac',
     family: 'Tecumseh Products',
     aliases: ['tecumseh'],
@@ -601,9 +788,25 @@ export const DECODE_DB = [
       'https://fastwaterheater.com/blog/find-your-water-tank-age-based-on-the-brand/',
     ],
     serialRules: [
-      { id: 'rheem-wh-mmyy', test: /^(\d{2})(\d{2})/, map: { monthNum: 1, yearShort: 2 },
-        confidence: 'high', note: 'MMYY (month+year)',
+      // Rheem's own two examples don't even agree on internal shape
+      // (one all-digit, one digit-letter-digit) — multiple independent
+      // sources confirm Rheem genuinely varies serial format by plant/era
+      // even within the "modern" MMYY-prefixed style, so this can't be
+      // anchored to one exact character pattern without rejecting real,
+      // validly-different serials (a false-negative trade that's worse
+      // than the false-positive it would fix). What IS consistent across
+      // every documented modern Rheem format is total length: 10-11
+      // characters. Bounding length (without constraining what's inside
+      // it) still blocks the actual failure mode seen in the field —
+      // short noise fragments and long unrelated digit runs "decoding"
+      // to a plausible month/year — while staying honest about the
+      // brand's real format variability.
+      { id: 'rheem-wh-mmyy', test: /^(\d{2})(\d{2})[A-Z0-9]{6,7}$/, map: { monthNum: 1, yearShort: 2 },
+        confidence: 'high', note: 'MMYY (month+year), 10-11 char modern format',
         examples: [['0884810488', { year: 1984, month: 8 }], ['1291A39968', { year: 1991, month: 12 }]] },
+      { id: 'rheem-wh-mmyy-loose', test: /^(\d{2})(\d{2})/, map: { monthNum: 1, yearShort: 2 },
+        confidence: 'low', note: 'MMYY assumed - serial length matches no known modern Rheem style, confirm against the plate',
+        examples: [] },
     ],
   },
   {
@@ -612,15 +815,30 @@ export const DECODE_DB = [
     family: 'A.O. Smith',
     aliases: ['a.o. smith', 'ao smith', 'a o smith', 'state', 'reliance', 'american water heater',
       'american', 'us craftmaster', 'craftmaster', 'whirlpool', 'kenmore', 'gsw', 'glascote', 'perma-glas'],
-    modelPrefixes: [/^(?:GCV|GPV|GDHE|ENT|ENS|FPSH|BTH|DVE|DRE|HYB|XCV)/],
+    // EJC added: A.O. Smith's point-of-use/lavatory water heater line, seen
+    // in the field (model "EJC 6 200"). Not adding State Industries' "EN6"
+    // family here — "EN" alone is too short/generic a prefix for a fallback
+    // match and risks false-positiving on unrelated brands; that unit's
+    // brand still detects fine from the plate text itself.
+    modelPrefixes: [/^(?:GCV|GPV|GDHE|ENT|ENS|FPSH|BTH|DVE|DRE|HYB|XCV|EJC)/],
     sources: [
       'https://fastwaterheater.com/water-heaters/water-heater-model-numbers-rating-plates/',
       'https://kcwaterheater.com/how-old-is-my-water-heater/',
     ],
     serialRules: [
-      { id: 'aosmith-yyww', test: /^(\d{2})(\d{2})/, map: { year2000: 1, week: 2 },
-        confidence: 'high', note: 'YYWW (year+week)',
+      // Multiple independent sources confirm the modern (2008+) A.O.
+      // Smith format is 10-13 characters total, YYWW + plant
+      // code/sequence — both DB examples are 10 chars with a plant
+      // letter at position 5. Anchoring length (loosely, to match the
+      // documented 10-13 range) blocks the same false-positive shape as
+      // the Carrier/Goodman fix: a bare 4-digit prefix test let any
+      // digit-leading noise token "decode" to a plausible year/week.
+      { id: 'aosmith-yyww', test: /^(\d{2})(\d{2})[A-Z0-9]{6,9}$/, map: { year2000: 1, week: 2 },
+        confidence: 'high', note: 'YYWW (year+week), 10-13 char modern format',
         examples: [['1512A00000', { year: 2015, week: 12 }], ['1220A00000', { year: 2012, week: 20 }]] },
+      { id: 'aosmith-yyww-loose', test: /^(\d{2})(\d{2})/, map: { year2000: 1, week: 2 },
+        confidence: 'low', note: 'YYWW assumed - serial length matches no known modern A.O. Smith style, confirm against the plate',
+        examples: [] },
     ],
   },
   {
@@ -744,4 +962,66 @@ export const DECODE_DB = [
   plateOnly('Caterpillar', 'electrical', ['caterpillar', 'cat generator'], PLATE_DATE, { family: 'Caterpillar' }),
   plateOnly('ASCO', 'electrical', ['asco'], PLATE_DATE, { family: 'Schneider Electric' }),
   plateOnly('Russelectric', 'electrical', ['russelectric'], PLATE_DATE, { family: 'Siemens' }),
+
+  // ══════════════════════════ VAV / AIR TERMINALS ══════════════════════════
+  // New category. No tonnage/gallons here — the decodable field is inlet
+  // size (inches) or, for fan-powered/reheat boxes, heater kW; both are read
+  // directly off the plate in nomenclature.js rather than decoded from a
+  // model code. None of these manufacturers encode a date into the serial
+  // the way HVAC compressors do, as far as verified — every plate seen so
+  // far just prints "DATE:" directly, which is what PLATE_DATE describes.
+  plateOnly('Redd-i', 'vav', ['redd-i', 'reddi'], PLATE_DATE,
+    { family: 'TPI Corp', notes: 'VAV terminal units and fan-powered/reheat boxes. Confirmed from field nameplates (MVA-series standard VAV, SRFHE-series fan-powered reheat) — Gray, TN.' }),
+  plateOnly('Titus', 'vav', ['titus hvac', 'titus air'], PLATE_DATE, { family: 'Titus (Envirotech)' }),
+  plateOnly('Price Industries', 'vav', ['price industries', 'price hvac'], PLATE_DATE, { family: 'Price Industries' }),
+  plateOnly('Krueger', 'vav', ['krueger hvac', 'krueger air'], PLATE_DATE, { family: 'Air System Components' }),
+  plateOnly('Nailor', 'vav', ['nailor industries', 'nailor'], PLATE_DATE, { family: 'Nailor Industries' }),
+  plateOnly('Metal Industries', 'vav', ['metal industries'], PLATE_DATE, { family: 'Metal Industries' }),
+  plateOnly('Anemostat', 'vav', ['anemostat'], PLATE_DATE, { family: 'Mestek' }),
+  plateOnly('Greenheck', 'vav', ['greenheck'], PLATE_DATE, { family: 'Greenheck', notes: 'Fans, dampers, louvers — not VAV boxes specifically, but shares this category for lack of a tonnage/gallons field.' }),
+  plateOnly('Loren Cook', 'vav', ['loren cook', 'cook fan'], PLATE_DATE, { family: 'Loren Cook Company', notes: 'Fans.' }),
+
+  // ══════════════════════════ BACKFLOW PREVENTERS ══════════════════════════
+  // New category, brand/alias detection only for now — deliberately no
+  // fabricated serial-to-date scheme. Decodable field is nominal pipe size +
+  // assembly type (RPZ/DC/PVB), both read directly off the plate. If a test
+  // tag with an inspection date is present, that's a separate compliance
+  // record, not a manufacture-date decode, and isn't something this pipeline
+  // reads yet.
+  plateOnly('Watts', 'backflow', ['watts backflow', 'watts regulator', 'watts water'], NO_SCHEME, { family: 'Watts Water Technologies' }),
+  plateOnly('Febco', 'backflow', ['febco'], NO_SCHEME, { family: 'Watts Water Technologies' }),
+  plateOnly('Wilkins', 'backflow', ['wilkins', 'zurn wilkins'], NO_SCHEME, { family: 'Zurn' }),
+  plateOnly('Ames', 'backflow', ['ames fire', 'ames backflow'], NO_SCHEME, { family: 'Watts Water Technologies' }),
+  plateOnly('Conbraco / Apollo', 'backflow', ['conbraco', 'apollo backflow', 'apollo valves'], NO_SCHEME, { family: 'Aalberts (Conbraco)' }),
+  plateOnly('Cla-Val', 'backflow', ['cla-val', 'cla val'], NO_SCHEME, { family: 'Cla-Val' }),
+];
+
+// ─────────────────────────────────────────────────────────────────────────
+// CONFIRMED FIELD MODELS — real model numbers read directly off physical
+// nameplates during field-photo review sessions (2026-07 decoder-accuracy
+// pass), not synthesized or guessed. Used ONLY as a fuzzy-match anchor
+// corpus (nameplateSmart.js) so a token that's one or two characters off
+// from an already-confirmed real model — the kind of OCR insertion/deletion
+// error the O/0-I/1-G/6-Z/2 substitution repair can't fix — still surfaces
+// as a low-confidence candidate instead of nothing. This list does NOT
+// create or imply any capacity/serial decode rule by itself; it exists
+// purely to catch "the model is corrupted but we've genuinely seen this
+// exact model before" as a distinct, honestly-labeled signal.
+export const CONFIRMED_FIELD_MODELS = [
+  { brand: 'ICP (Heil / Tempstar / Comfortmaker)', category: 'hvac', model: 'N4A336AKB200' },
+  { brand: 'ICP (Heil / Tempstar / Comfortmaker)', category: 'hvac', model: 'CHS121HAA0A00AA' },
+  { brand: 'ICP (Heil / Tempstar / Comfortmaker)', category: 'hvac', model: 'NAC236AKA1' },
+  { brand: 'Goodman', category: 'hvac', model: 'GSC130361GB' },
+  { brand: 'Lennox', category: 'hvac', model: '13HPX-048-230-18' },
+  { brand: 'Lennox', category: 'hvac', model: '14HPX-060-230-19' },
+  { brand: 'Lennox', category: 'hvac', model: 'XC16S048-230-04' },
+  { brand: 'Trane', category: 'hvac', model: '2A7A1024A1000AA' },
+  { brand: 'Trane', category: 'hvac', model: 'TWA120A300FB' },
+  { brand: 'Trane', category: 'hvac', model: '4TTR3036E1000AA' },
+  { brand: 'Carrier', category: 'hvac', model: '25HCE460A500' },
+  { brand: 'Carrier', category: 'hvac', model: 'FB4CNP061' },
+  { brand: 'A.O. Smith (Water Heater)', category: 'waterheater', model: 'EJC6200' },
+  { brand: 'A.O. Smith (Water Heater)', category: 'waterheater', model: 'EN6-40-DORS110' },
+  { brand: 'Redd-i', category: 'vav', model: 'MVA-12' },
+  { brand: 'Redd-i', category: 'vav', model: 'SRFHE1500-12' },
 ];

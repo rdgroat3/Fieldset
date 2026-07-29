@@ -5,9 +5,20 @@ import { Backdrop, ActionCardShell, Press } from '../components/Surface';
 import { useProjects } from '../store/ProjectContext';
 import { color, radius, space, font } from '../theme/tokens';
 
-export default function ProjectsScreen({ navigation }) {
+/**
+ * Doubles as the survey list AND the "which survey?" picker for the
+ * Deliverables shortcut on the landing screen.
+ *
+ * `route.params.pick === 'export'` switches the destination of a tap from
+ * the survey home to its export screen. Same list, same rows — the only
+ * thing that changes is where you land and what the header says you're
+ * doing. That's deliberately lighter than a separate picker screen: there
+ * is exactly one list of surveys in this app and it should stay that way.
+ */
+export default function ProjectsScreen({ navigation, route }) {
   const insets = useSafeAreaInsets();
   const { projects, loaded, deleteProject } = useProjects();
+  const pickForExport = route?.params?.pick === 'export';
 
   const confirmDelete = (project) => {
     Alert.alert(
@@ -24,8 +35,12 @@ export default function ProjectsScreen({ navigation }) {
     <Backdrop>
       <View style={{ flex: 1, paddingTop: insets.top }}>
         <View style={styles.header}>
-          <Text style={styles.wordmark}>Recent Surveys</Text>
-          <Text style={styles.sub}>Point your phone at the building. Walk out with the deliverables done.</Text>
+          <Text style={styles.wordmark}>{pickForExport ? 'Export which survey?' : 'Recent Surveys'}</Text>
+          <Text style={styles.sub}>
+            {pickForExport
+              ? 'Pick a survey to open its deliverables \u2014 report, photo log, inventory, riser.'
+              : 'Point your phone at the building. Walk out with the deliverables done.'}
+          </Text>
         </View>
 
         <FlatList
@@ -42,9 +57,21 @@ export default function ProjectsScreen({ navigation }) {
           }
           renderItem={({ item }) => {
             const flags = item.photos.filter((p) => p.flagged).length;
+            // Last ACTIVITY, not creation date. A survey resumed on a second
+            // day should read as recent; the created date buries it.
+            const lastAt = item.photos.reduce((acc, p) => {
+              const t = new Date(p.takenAt).getTime();
+              return isFinite(t) && t > acc ? t : acc;
+            }, new Date(item.createdAt).getTime() || 0);
+            const nameplates = item.photos.filter(
+              (p) => p.nameplate && (p.nameplate.make || p.nameplate.model || p.nameplate.serial)
+            ).length;
             return (
               <Press
-                onPress={() => navigation.navigate('ProjectHome', { projectId: item.id })}
+                onPress={() => navigation.navigate(
+                  pickForExport ? 'Export' : 'ProjectHome',
+                  { projectId: item.id }
+                )}
                 onLongPress={() => confirmDelete(item)}
                 scaleTo={0.985}
                 style={{ marginBottom: 10 }}
@@ -54,7 +81,12 @@ export default function ProjectsScreen({ navigation }) {
                     <View style={{ flex: 1, minWidth: 0 }}>
                       <Text numberOfLines={1} style={styles.cardTitle}>{item.name}</Text>
                       <Text style={styles.cardMeta}>
-                        {item.profile} · {new Date(item.createdAt).toLocaleDateString()}
+                        {/* Separators go through expressions, not JSX text.
+                            A bare \u00b7 in a text node renders as the six
+                            literal characters, not a middot. */}
+                        {item.profile}{'\u00b7'.padStart(3, ' ')}last worked{' '}
+                        {lastAt ? new Date(lastAt).toLocaleDateString() : '\u2014'}
+                        {nameplates > 0 ? ` \u00b7 ${nameplates} nameplate${nameplates > 1 ? 's' : ''}` : ''}
                       </Text>
                     </View>
                     <View style={styles.counts}>
@@ -69,7 +101,9 @@ export default function ProjectsScreen({ navigation }) {
           }}
         />
 
-        <Text style={styles.hint}>Long-press a survey to delete it</Text>
+        <Text style={styles.hint}>
+          {pickForExport ? 'Tap a survey to open its deliverables' : 'Long-press a survey to delete it'}
+        </Text>
       </View>
     </Backdrop>
   );

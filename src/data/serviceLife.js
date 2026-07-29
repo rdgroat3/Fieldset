@@ -85,6 +85,7 @@ const TEXT_RULES = [
   [/cooling\s*tower/i, 'cooling_tower_metal'],
   [/\bvav\b/i, 'vav_box'],
   [/\bptac\b|packaged\s*terminal|through[-\s]the[-\s]wall/i, 'ptac'],
+  [/backflow|reduced\s*pressure\s*zone|\brpz\b|double\s*check\s*valve|\bdcva\b|vacuum\s*breaker|\bpvb\b/i, 'backflow_preventer'],
   [/condens(ing|er)\s*unit|\bcondenser\b/i, 'split_ac'],
   [/mini[-\s]?split|split[-\s]system/i, 'split_ac'],
   [/window/i, 'window_ac'],
@@ -136,8 +137,13 @@ export function classifyEquipment({ text = '', model = '', make = '', capacity =
   if (byModel) return { typeId: byModel, confidence: 'medium', basis: 'model prefix' };
   // 3) Capacity hint: gallons => water heater.
   if (/\bgal(lon)?s?\b/i.test(capacity)) return { typeId: 'water_heater_tank', confidence: 'medium', basis: 'capacity (gallons)' };
-  // 4) Category default.
+  // 4) Category default — the surveyor's own category selection is a
+  // reasonable last resort when neither the text nor the model number
+  // named the equipment explicitly (e.g. a fan-powered box's plate cropped
+  // to just the electrical data table, with no "VAV" text visible at all).
   if (category === 'waterheater') return { typeId: 'water_heater_tank', confidence: 'low', basis: 'category default' };
+  if (category === 'vav') return { typeId: 'vav_box', confidence: 'low', basis: 'category default' };
+  if (category === 'backflow') return { typeId: 'backflow_preventer', confidence: 'low', basis: 'category default' };
   return { typeId: 'generic_hvac', confidence: 'low', basis: 'default (unclassified)' };
 }
 
@@ -173,6 +179,15 @@ export function refrigerantFlag(text, year) {
 // remaining useful life, percent-of-life consumed, and a priority bucket.
 export function assessCondition(year, typeId = 'generic_hvac') {
   if (!year) return null;
+  // 'backflow_preventer' is intentionally NOT in SERVICE_LIFE: published
+  // lifespan claims for backflow assemblies range from ~5 years (RPZ
+  // internals needing rebuild) to 20-25 years (the housing, well
+  // maintained) with no ASHRAE-equivalent consensus figure the rest of this
+  // table is built on — sources disagree by 4-5x. Silently falling back to
+  // generic_hvac's number here would print a specific, confident-looking
+  // year that's really just a condenser's service life mislabeled onto a
+  // check valve assembly. No banner is more honest than a wrong one.
+  if (typeId === 'backflow_preventer') return null;
   const now = new Date().getFullYear();
   const age = now - year;
   const entry = SERVICE_LIFE[typeId] || SERVICE_LIFE.generic_hvac;

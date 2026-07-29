@@ -10,23 +10,9 @@ const Ctx = createContext(null);
 
 const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
 
-export const DEFAULT_SETTINGS = {
-  firmName: '',
-  logoUri: null,
-  // Capture quality. Photos were being compressed twice — once by
-  // takePictureAsync(quality) and again by the ViewShot watermark burn — so
-  // the saved JPEG was noticeably softer than the live preview. Both now run
-  // at full quality by default, and the watermark burn (the lossier of the
-  // two, since it re-encodes a screen-resolution composite) can be turned off
-  // entirely for surveys where sharpness matters more than the stamp.
-  photoQuality: 1,       // 0..1 passed to takePictureAsync
-  burnWatermark: true,   // false = keep the ORIGINAL full-res file, no re-encode
-  blurCheck: true,       // false = never show the "Blurry shot" popup
-};
-
 export function ProjectProvider({ children }) {
   const [projects, setProjects] = useState([]);
-  const [settings, setSettings] = useState(DEFAULT_SETTINGS);
+  const [settings, setSettings] = useState({ firmName: '', logoUri: null });
   const [loaded, setLoaded] = useState(false);
 
   useEffect(() => {
@@ -35,10 +21,7 @@ export function ProjectProvider({ children }) {
       .catch(() => setProjects([]))
       .finally(() => setLoaded(true));
     AsyncStorage.getItem(SKEY)
-      // Merged over the defaults, not assigned raw: a settings blob written by
-      // an older build has no photoQuality/burnWatermark keys, and assigning
-      // it directly would leave them undefined rather than defaulted.
-      .then((s) => { if (s) setSettings({ ...DEFAULT_SETTINGS, ...JSON.parse(s) }); })
+      .then((s) => { if (s) setSettings(JSON.parse(s)); })
       .catch(() => {});
   }, []);
 
@@ -66,18 +49,8 @@ export function ProjectProvider({ children }) {
 
   const addPhoto = useCallback((projectId, photo) => {
     const id = uid();
-    // GEN default is enforced HERE, not at each call site. CameraScreen is not
-    // the only path that creates photos — DecoderScreen, ReviewScreen and
-    // CaptureScreen all call addPhoto too, and none of them set systems[].
-    // Defaulting per-screen would have left three of five paths able to save
-    // an untagged photo, which is exactly the state the default exists to
-    // prevent. `system` stays the derived string the gallery/CSV/report read.
-    const systems = Array.isArray(photo.systems) && photo.systems.length
-      ? photo.systems
-      : ['GEN'];
-    const normalized = { ...photo, systems, system: photo.system || systems.join('+') };
     persist(projects.map((p) =>
-      p.id === projectId ? { ...p, photos: [...p.photos, { id, takenAt: new Date().toISOString(), ...normalized }] } : p
+      p.id === projectId ? { ...p, photos: [...p.photos, { id, takenAt: new Date().toISOString(), ...photo }] } : p
     ));
     return id;
   }, [projects, persist]);
@@ -90,44 +63,39 @@ export function ProjectProvider({ children }) {
     ));
   }, [projects, persist]);
 
-  const deletePhoto = useCallback((projectId, photoId) => {
-    persist(projects.map((p) =>
-      p.id === projectId ? { ...p, photos: p.photos.filter((ph) => ph.id !== photoId) } : p
-    ));
-  }, [projects, persist]);
-
-  /**
-   * Bulk photo update. FinalizeScreen's tag/move actions call this against a
-   * whole selection; it existed on the screen's side of the contract but was
-   * never exported here, so `updatePhotos(...)` was undefined and tagging a
-   * photo threw "updatePhotos is not a function" — that was the crash.
-   *
-   * `patch` may be a plain object (merged into every matched photo) or a
-   * function (photo) => patchObject, so per-photo logic like toggling one tag
-   * out of an existing systems[] can be expressed without reading state twice.
-   */
-  const updatePhotos = useCallback((projectId, photoIds, patch) => {
-    const ids = new Set(photoIds || []);
-    if (ids.size === 0) return;
+  // Batch version of updatePhoto: applies a patch (or a per-photo patch via
+  // a function) to many photos in ONE persist/write, used by the Finalize
+  // review screen for bulk tagging and bulk room reassignment. Looping
+  // single updatePhoto calls would read-modify-write AsyncStorage once per
+  // photo, which is both slower and drops updates if called in a tight loop
+  // (each call captures a stale `projects` snapshot).
+  const updatePhotos = useCallback((projectId, photoIds, patchOrFn) => {
+    const idSet = new Set(photoIds);
     persist(projects.map((p) =>
       p.id === projectId
         ? {
             ...p,
             photos: p.photos.map((ph) => {
-              if (!ids.has(ph.id)) return ph;
-              const delta = typeof patch === 'function' ? patch(ph) : patch;
-              return delta ? { ...ph, ...delta } : ph;
+              if (!idSet.has(ph.id)) return ph;
+              const patch = typeof patchOrFn === 'function' ? patchOrFn(ph) : patchOrFn;
+              return { ...ph, ...patch };
             }),
           }
         : p
     ));
   }, [projects, persist]);
 
-  const deletePhotos = useCallback((projectId, photoIds) => {
-    const ids = new Set(photoIds || []);
-    if (ids.size === 0) return;
+  const deletePhoto = useCallback((projectId, photoId) => {
     persist(projects.map((p) =>
-      p.id === projectId ? { ...p, photos: p.photos.filter((ph) => !ids.has(ph.id)) } : p
+      p.id === projectId ? { ...p, photos: p.photos.filter((ph) => ph.id !== photoId) } : p
+    ));
+  }, [projects, persist]);
+
+  // Batch delete, same rationale as updatePhotos.
+  const deletePhotos = useCallback((projectId, photoIds) => {
+    const idSet = new Set(photoIds);
+    persist(projects.map((p) =>
+      p.id === projectId ? { ...p, photos: p.photos.filter((ph) => !idSet.has(ph.id)) } : p
     ));
   }, [projects, persist]);
 
@@ -175,7 +143,7 @@ export function ProjectProvider({ children }) {
     <Ctx.Provider value={{
       loaded, projects,
       createProject, updateProject, deleteProject,
-      addPhoto, updatePhoto, deletePhoto, updatePhotos, deletePhotos,
+      addPhoto, updatePhoto, updatePhotos, deletePhoto, deletePhotos,
       addPanel, updatePanel, addMeasurement,
       settings, updateSettings,
     }}>

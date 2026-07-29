@@ -35,6 +35,22 @@ export async function pendingCount(projectId) {
   return projectId ? q.filter((i) => i.projectId === projectId).length : q.length;
 }
 
+// Give up on an individual item after this many SERVER-SIDE rejections.
+// Transport failures (offline/timeout) deliberately do not count.
+const MAX_ATTEMPTS = 10;
+
+/**
+ * Returns a discriminated result rather than a bare value:
+ *   { ok: true,  data }
+ *   { ok: false, reason: 'transport' }        network down / timed out
+ *   { ok: false, reason: 'http-<status>' }    server reached, said no
+ *   { ok: false, reason: 'bad-json' | 'bad-shape' }
+ *
+ * The old version returned null for all of these, which made it impossible
+ * for processQueue to tell "the phone is in a basement" from "this one
+ * record will never decode" — and it guessed wrong in the direction that
+ * stalled the whole queue.
+ */
 async function callWorker(rawText) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), AI_DECODE.TIMEOUT_MS);
@@ -45,42 +61,97 @@ async function callWorker(rawText) {
       body: JSON.stringify({ text: rawText }),
       signal: controller.signal,
     });
-    if (!res.ok) return null;
-    const data = await res.json();
+    if (!res.ok) {
+      // 5xx is the server having a bad day — treat it like transport so we
+      // back off instead of burning through all ten attempts in one drain.
+      return { ok: false, reason: res.status >= 500 ? 'transport' : `http-${res.status}` };
+    }
+    let data;
+    try { data = await res.json(); }
+    catch (e) { return { ok: false, reason: 'bad-json' }; }
     // Expected shape: {make, model, serial, capacity, year, confidence, notes}
-    if (!data || typeof data !== 'object') return null;
-    return data;
+    if (!data || typeof data !== 'object') return { ok: false, reason: 'bad-shape' };
+    return { ok: true, data };
   } catch (e) {
-    return null; // offline or timeout — stays queued
+    return { ok: false, reason: 'transport' }; // offline or timeout — stays queued
   } finally {
     clearTimeout(timer);
   }
 }
 
-// Drain the queue. Returns [{projectId, photoId, decoded}] for the caller
-// to apply via the store (this module stays store-agnostic).
+/**
+ * Drain the queue. Returns [{projectId, photoId, decoded}] for the caller
+ * to apply via the store (this module stays store-agnostic).
+ *
+ * STARVATION FIX
+ * --------------
+ * The previous loop did `if (!decoded) break;` on the FIRST failure and
+ * treated that as "we must be offline". It isn't the same thing. A single
+ * item that fails deterministically — a payload the Worker rejects with a
+ * 400, OCR text so garbled the model returns nothing usable, a record whose
+ * rawText got truncated in storage — returns null forever, and the break
+ * meant every item behind it in the queue was never attempted at all. One
+ * bad nameplate could stall an entire survey's AI decodes for ten
+ * foreground cycles (the attempts<10 cap) before the queue unwedged itself.
+ *
+ * Distinguishing the two cases needs a signal the old callWorker threw
+ * away: it collapsed "network unreachable" and "server said no" into the
+ * same `null`. It now reports WHY it failed, so:
+ *
+ *   - a transport failure (offline / timeout) still stops the drain
+ *     immediately, because hammering a dead network is pointless and
+ *     burns battery; nothing is counted as an attempt.
+ *   - a server-side rejection counts an attempt against THAT item only and
+ *     the drain moves on to the next one.
+ *
+ * The head of the queue also rotates on failure, so even a pathological
+ * item that somehow keeps returning a transport-shaped error can't pin the
+ * same position forever.
+ */
 export async function processQueue() {
   if (!aiDecodeEnabled()) return [];
-  let q = await getQueue();
+  const q = await getQueue();
   if (!q.length) return [];
 
   const applied = [];
   const remaining = [];
+  let offline = false;
 
-  for (const item of q) {
-    const decoded = await callWorker(item.rawText);
-    if (decoded && (decoded.make || decoded.model || decoded.capacity)) {
-      applied.push({ projectId: item.projectId, photoId: item.photoId, decoded });
-    } else {
-      item.attempts += 1;
-      if (item.attempts < 10) remaining.push(item); // give up after 10 tries
+  for (let i = 0; i < q.length; i++) {
+    const item = q[i];
+
+    if (offline) { remaining.push(item); continue; }
+
+    const res = await callWorker(item.rawText);
+
+    if (res.ok && res.data && (res.data.make || res.data.model || res.data.capacity)) {
+      applied.push({ projectId: item.projectId, photoId: item.photoId, decoded: res.data });
+      continue;
     }
-    if (!decoded) break; // likely offline — stop hammering, keep the rest queued
+
+    if (res.reason === 'transport') {
+      // Genuinely can't reach the Worker. Stop trying, keep everything
+      // queued, and do NOT burn an attempt — being offline is not the
+      // item's fault and shouldn't count toward giving up on it.
+      offline = true;
+      remaining.push(item);
+      continue;
+    }
+
+    // Server reachable, this item didn't decode. That's on the item.
+    const attempts = (item.attempts || 0) + 1;
+    if (attempts < MAX_ATTEMPTS) {
+      remaining.push({ ...item, attempts, lastError: res.reason || 'no-result' });
+    }
+    // else: dropped. It stays visible as a photo with no AI decode, which
+    // is the honest outcome — better than a queue that never empties.
   }
 
-  // Anything after an offline break stays queued untouched
-  const processedIds = new Set([...applied.map((a) => a.photoId), ...remaining.map((r) => r.photoId)]);
-  for (const item of q) if (!processedIds.has(item.photoId)) remaining.push(item);
+  // Failed items go to the BACK. Without this, an item that fails in a way
+  // we can't classify sits at position 0 on every future drain and gets
+  // first crack at the network every time, which is exactly the starvation
+  // shape this function exists to avoid.
+  remaining.sort((a, b) => (a.attempts || 0) - (b.attempts || 0));
 
   await setQueue(remaining);
   return applied;
