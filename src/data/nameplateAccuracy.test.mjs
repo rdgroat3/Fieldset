@@ -24,8 +24,8 @@
 
 import { parseNameplateText } from './nomenclature.js';
 import { extractSmart } from './nameplateSmart.js';
-import { CORPUS, CORPUS2, CORPUS3, CORPUS4, CORPUS5 } from './nameplateCorpus.mjs';
-const ALL = [...CORPUS, ...CORPUS2, ...CORPUS3, ...CORPUS4, ...CORPUS5];
+import { CORPUS, CORPUS2, CORPUS3, CORPUS4, CORPUS5, CORPUS6 } from './nameplateCorpus.mjs';
+const ALL = [...CORPUS, ...CORPUS2, ...CORPUS3, ...CORPUS4, ...CORPUS5, ...CORPUS6];
 
 const flatText = (blocks) =>
   blocks.flatMap((b) => b.lines.map((l) => l.text)).join('\n');

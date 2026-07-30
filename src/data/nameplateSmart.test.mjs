@@ -404,5 +404,51 @@ const BTilted = (rows, angleDeg, pivot) => rows.map(([text, left, top, width, he
   ok(!p.make, 'no cross-category brand invented from a short token', p.make);
 }
 
+/* ── Bare-numeric models, and the rating rejection that used to eat them.
+ *
+ * `looksLikeValue` rejects rating-shaped tokens, which is right in isolation:
+ * "175" beside MAX PRESSURE and "208" beside VOLTS are the bulk of a plate's
+ * text and the main source of junk candidates. But valueToRight/valueBelow
+ * gate on the same predicate, so the rejection also applied to the cell in
+ * the VALUE POSITION OF A MODEL LABEL — and some real model numbers are bare
+ * numbers. Watts sells the Series 909 RPZ, Febco the 825, Wilkins the 975.
+ * The Watts fixture in CORPUS6 read its brand, serial and manufacture date
+ * correctly and left the model blank.
+ *
+ * The waiver is scoped to an explicit label anchor. Unanchored rating tokens
+ * must still be rejected, or every plate's ratings block floods the list. */
+{
+  const rows = [
+    ['WATTS REGULATOR CO', 40, 10, 300, 24],
+    ['SERIES', 40, 45, 90, 22], ['909', 200, 45, 70, 22],
+    ['SERIAL NO', 40, 75, 120, 22], ['WR2244881', 200, 75, 160, 22],
+    ['MAX WORKING PRESSURE', 40, 110, 240, 22], ['175 PSI', 300, 110, 100, 22],
+  ];
+  const p = parseNameplateText(textOf(rows), 'backflow', B(rows));
+  ok(p.model === '909', 'bare-numeric model anchored to a SERIES label is read', p.model);
+  ok(p.serial === 'WR2244881', 'serial still reads alongside it', p.serial);
+
+  const s = extractSmart({ text: textOf(rows), blocks: B(rows) }, 'backflow', p.make || null);
+  const cands = (s.candidates?.model || []).map((c) => c.value);
+  ok(!cands.some((v) => /^175/.test(v)),
+    'the pressure rating does not become a model candidate', cands);
+}
+{
+  // SERIES is a model label, but a rating cell next to an unrelated label
+  // must not reach the model bag through the waiver.
+  const rows = [
+    ['CARRIER CORPORATION', 40, 10, 300, 24],
+    ['MODEL NO.', 40, 50, 120, 22], ['48TCED08A2A5', 200, 50, 230, 22],
+    ['VOLTS', 40, 80, 70, 22], ['208', 200, 80, 60, 22],
+    ['MAX FUSE', 40, 110, 110, 22], ['40', 200, 110, 40, 22],
+  ];
+  const p = parseNameplateText(textOf(rows), 'hvac', B(rows));
+  ok(p.model === '48TCED08A2A5', 'real model still wins over rating cells', p.model);
+  const s = extractSmart({ text: textOf(rows), blocks: B(rows) }, 'hvac', p.make || null);
+  const cands = (s.candidates?.model || []).map((c) => c.value);
+  ok(cands.length === 1 && cands[0] === '48TCED08A2A5',
+    'ratings block contributes no model candidates', cands);
+}
+
 console.log(`\n${pass} passed, ${fail} failed`);
 if (bad.length) { console.log('\n' + bad.join('\n\n')); process.exit(1); }

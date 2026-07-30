@@ -856,3 +856,83 @@ export const CORPUS5 = [
     expect: { make: 'Burnham', model: 'V1108', serial: 'BN334455', year: 2003, capacityIsTons: false },
   },
 ];
+
+// ─────────────────────────── CORPUS 6 — BACKFLOW ───────────────────────────
+//
+// The `backflow` category had no fixture at all: six catalog brands, zero
+// plates, and therefore a precision figure that said nothing about it.
+//
+// It is also the category where the round-3 date-qualifier work is most
+// exposed. Every one of these six brands is deliberately rule-free — there is
+// no published serial-to-date scheme for any of them — so a printed date is
+// the ONLY possible source of a year. And a backflow preventer is, by code,
+// tested annually and tagged with the result: the plate and its surroundings
+// carry more non-manufacture dates than any other equipment a surveyor
+// photographs. Reading the wrong one is not an edge case here, it is the
+// default failure.
+export const CORPUS6 = [
+  {
+    id: 'watts-909-mfg-and-test',
+    note: 'Watts RPZ carrying BOTH a manufacture date and an annual retest tag',
+    category: 'backflow',
+    blocks: [{ lines: [
+      L('WATTS REGULATOR CO', 40, 10, 300),
+      L('SERIES', 40, 45, 90), L('909', 200, 45, 70),
+      L('SIZE', 40, 75, 70), L('2 IN', 200, 75, 70),
+      L('SERIAL NO', 40, 105, 120), L('WR2244881', 200, 105, 160),
+      L('MFG DATE', 40, 135, 120), L('06/2015', 200, 135, 110),
+      // The retest tag. Physically a separate sticker, but it lands in the
+      // same OCR pass and sits below the plate, which is exactly the layout
+      // NON_MFG_DATE_QUALIFIER has to survive.
+      L('ANNUAL TEST DATE', 40, 175, 200), L('03/2024', 260, 175, 110),
+      L('TESTED BY', 40, 205, 120), L('CERT #4471', 200, 205, 140),
+      L('MAX WORKING PRESSURE', 40, 240, 240), L('175 PSI', 300, 240, 100),
+    ] }],
+    expect: { make: 'Watts', model: '909', serial: 'WR2244881', year: 2015, capacityIsTons: false },
+  },
+  {
+    id: 'wilkins-975-test-date-only',
+    note: 'Zurn Wilkins with ONLY a retest date — the correct answer is no year',
+    category: 'backflow',
+    blocks: [{ lines: [
+      L('ZURN WILKINS', 40, 10, 220),
+      L('MODEL', 40, 45, 90), L('975XL2', 200, 45, 110),
+      L('SIZE', 40, 75, 70), L('1 IN', 200, 75, 70),
+      L('SERIAL', 40, 105, 90), L('ZW10029384', 200, 105, 170),
+      // No manufacture date anywhere on this one. A decoder that treats any
+      // date as a build date reports a decades-old device as current and
+      // drops it off the replacement schedule with a full life ahead of it.
+      L('TEST DATE', 40, 145, 120), L('2024', 200, 145, 80),
+      L('RETEST DUE', 40, 175, 140), L('2025', 220, 175, 80),
+    ] }],
+    expect: { make: 'Wilkins', model: '975XL2', serial: 'ZW10029384', year: null, capacityIsTons: false },
+  },
+  {
+    id: 'febco-825y-no-date',
+    note: 'Febco RP assembly, no date of any kind — blank year is the pass condition',
+    category: 'backflow',
+    blocks: [{ lines: [
+      L('FEBCO', 40, 10, 130),
+      L('MODEL NO', 40, 45, 120), L('825YA', 200, 45, 100),
+      L('SIZE', 40, 75, 70), L('1-1/2 IN', 200, 75, 110),
+      L('SERIAL NO', 40, 105, 120), L('FB889210', 200, 105, 150),
+      L('MAX WORKING PRESSURE', 40, 140, 240), L('175 PSI', 300, 140, 100),
+      L('TEMP RANGE', 40, 170, 150), L('33-140 F', 220, 170, 110),
+    ] }],
+    expect: { make: 'Febco', model: '825YA', serial: 'FB889210', year: null, capacityIsTons: false },
+  },
+  {
+    id: 'apollo-4a-punctuation',
+    note: 'Conbraco/Apollo — brand printed with spacing and punctuation variance',
+    category: 'backflow',
+    blocks: [{ lines: [
+      L('CONBRACO INDUSTRIES, INC.', 40, 10, 340),
+      L('APOLLO VALVES', 40, 40, 220),
+      L('MODEL', 40, 75, 90), L('4A-100-02', 200, 75, 150),
+      L('SERIAL', 40, 105, 90), L('CB4471902', 200, 105, 160),
+      L('MFG', 40, 135, 70), L('2019', 200, 135, 80),
+      L('MAX WORKING PRESSURE', 40, 170, 240), L('175 PSI', 300, 170, 100),
+    ] }],
+    expect: { make: 'Conbraco / Apollo', model: '4A-100-02', serial: 'CB4471902', year: 2019, capacityIsTons: false },
+  },
+];

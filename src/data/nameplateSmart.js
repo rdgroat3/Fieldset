@@ -48,7 +48,15 @@ import { detectBrand, decodeSerialCandidates } from './hvacDecode.js';
 // covers that recurring glued-label case without loosening the label
 // match itself.
 const LABEL_END = '(?=\\b|\\d)';
-const MODEL_LABEL = new RegExp(`^\\s*(M[O0]DE?L|M\\/N|MDL|M[O0]D)${LABEL_END}`, 'i');
+// SERIES is a model label on hydronic and backflow equipment, where the
+// catalogue designation IS the series number — Watts sells the "Series 909"
+// RPZ, not a model 909 in a series. Without it, a Watts plate whose only
+// model line reads "SERIES  909" left the model blank: no catalogue match,
+// nothing to price or cross-reference, and the surveyor retypes it.
+// Placed after the SERIAL alternatives in evaluation order, and safe against
+// them because LABEL_END requires a non-letter after the anchor, so the
+// "SER" in "SERIES" cannot be read as an abbreviated SERIAL.
+const MODEL_LABEL = new RegExp(`^\\s*(M[O0]DE?L|M\\/N|MDL|M[O0]D|SER[I1lB]ES)${LABEL_END}`, 'i');
 // SER[BR]AL tolerates the I->B misread that shows up on stamped/embossed
 // plates where OCR's clean confusion table (O/0, I/1) doesn't cover the
 // glyph shape well enough — B and I share enough of a stroke pattern under
@@ -256,7 +264,7 @@ export function isRatingToken(s) {
   return RATING_TOKENS.some((re) => re.test(t) || re.test(squashed));
 }
 
-export const looksLikeValue = (s, { requireDigit = true } = {}) => {
+export const looksLikeValue = (s, { requireDigit = true, allowRating = false } = {}) => {
   const t = String(s || '').trim();
   if (t.length < 3 || t.length > 26) return false;
   if (!/^[A-Z0-9]/i.test(t)) return false;
@@ -280,7 +288,14 @@ export const looksLikeValue = (s, { requireDigit = true } = {}) => {
   // numbers, capture chrome). These are the majority of a plate's text and
   // they satisfy every positive shape test below, so without an explicit
   // rejection they outnumber the one real model number ten to one.
-  if (isRatingToken(t)) return false;
+  // `allowRating: false` is waived only for a cell sitting in the value
+  // position of an explicit MODEL/SERIAL label in a table layout. Some real
+  // model numbers ARE bare numbers — Watts sells the Series 909 RPZ, Febco
+  // the 825, Wilkins the 975 — and they are indistinguishable in isolation
+  // from "175" next to MAX PRESSURE. In isolation this rejection is right and
+  // stays the default. Anchored to a model label by geometry it is not: it
+  // was throwing away the one cell on the plate the manufacturer pointed at.
+  if (!allowRating && isRatingToken(t)) return false;
   // Must be code-shaped throughout (letters/digits/-/.//, internal spaces ok).
   if (!/^[A-Z0-9][A-Z0-9\-\/. ]{2,}$/i.test(t)) return false;
 
@@ -899,9 +914,14 @@ export function extractSmart(ocr, category, knownBrand) {
         bag.add(rest, 100, `next to its ${name} label`);
       } else if (!rest && haveGeom) {
         const clean = (txt) => stripLeadingLabelFragment(stripGluedLabel(txt));
-        const right = valueToRight(lineObjs, i);
+        // The label is the evidence here, so the rating-token rejection is
+        // waived — see looksLikeValue. Bare-numeric models are common on
+        // backflow and hydronic equipment and were being discarded before
+        // they became candidates.
+        const anchored = (txt) => looksLikeValue(txt, { allowRating: true });
+        const right = valueToRight(lineObjs, i, anchored);
         if (right) bag.add(clean(right.text), 85, `right of the ${name} label (table layout)`);
-        const below = valueBelow(lineObjs, i);
+        const below = valueBelow(lineObjs, i, anchored);
         if (below && (!right || compact(below.text) !== compact(right.text))) {
           // A cell to the RIGHT and a cell BELOW are alternative readings of
           // the same table, not two independent pieces of evidence. When the

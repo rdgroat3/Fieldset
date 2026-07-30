@@ -79,6 +79,32 @@ const TEXT_RULES = [
   [/air\s*handler|\bahu\b|fan\s*coil|\bfcu\b/i, 'air_handler'],
   [/heat\s*pump/i, 'heat_pump_res'],
   [/\bfurnace\b/i, 'furnace'],
+  // Boilers, most specific first — TEXT_RULES returns on the first match.
+  //
+  // `boiler_cast_iron` (30 yr) and `boiler_electric` (15 yr) were defined in
+  // SERVICE_LIFE but unreachable: the single /\bboiler\b/ rule below caught
+  // every boiler and sent it to steel (24 yr). Both directions cost real
+  // money on the schedule. A cast-iron sectional reads six years older than
+  // it is and hits REPLACE while it still has life — Weil-McLain sectionals
+  // routinely run past forty. An electric boiler reads nine years younger
+  // and stays "within service life" five years after it wasn't.
+  //
+  // Deliberately requiring the words ADJACENT rather than anywhere in the
+  // blob. "ELECTRIC" appears on the ratings block of practically every plate
+  // including gas boilers, and a loose match would pull those to a 15-year
+  // median — trading a known small error for an unknown larger one. Adjacent
+  // or nothing: a boiler whose plate does not say which kind it is stays
+  // steel, which is what the surveyor can correct in the type picker.
+  // `\s` matches newlines, and the first version of these rules used it: a
+  // Burnham GAS boiler whose next OCR line read "ELECTRICAL RATING 120V"
+  // classified as an ELECTRIC boiler and took a 15-year median instead of 24,
+  // arriving at REPLACE nine years early. Flat OCR text puts every line
+  // adjacent to every other, so adjacency across a newline is not adjacency
+  // at all. `[^\S\r\n]` is horizontal whitespace only, and the reverse forms
+  // additionally require punctuation — "BOILER (ELECTRIC)" is a real plate
+  // legend, "BOILER\nELECTRIC SUPPLY" is two unrelated fields.
+  [/cast[^\S\r\n]?-?[^\S\r\n]?iron[^\S\r\n]+(sectional[^\S\r\n]+)?boiler|boiler[^\S\r\n]*[(,-][^\S\r\n]*cast[^\S\r\n]?-?[^\S\r\n]?iron/i, 'boiler_cast_iron'],
+  [/electric(?:al)?[^\S\r\n]+boiler|boiler[^\S\r\n]*[(,-][^\S\r\n]*electric/i, 'boiler_electric'],
   [/\bboiler\b/i, 'boiler_steel'],
   [/centrifugal\s*chiller|chiller.*centrifugal/i, 'chiller_centrifugal'],
   [/\bchiller\b/i, 'chiller_air_cooled'],
@@ -190,7 +216,19 @@ export function assessCondition(year, typeId = 'generic_hvac') {
   if (typeId === 'backflow_preventer') return null;
   const now = new Date().getFullYear();
   const age = now - year;
-  const entry = SERVICE_LIFE[typeId] || SERVICE_LIFE.generic_hvac;
+  // An unrecognized id falls back to generic_hvac — but it used to be echoed
+  // back in `typeId` while the label and median came from generic_hvac, so
+  // the returned object disagreed with itself: typeId 'water_heater' (not a
+  // real id; the real ones are water_heater_tank/_tankless) alongside "HVAC
+  // Equipment (generic)" and an 18-year median. Anything reading typeId saw a
+  // specific equipment type that had not actually been applied.
+  //
+  // Report what was used, and name what was asked for separately, so a stored
+  // record carrying a retired id from an older build is visibly substituted
+  // rather than quietly averaged into a condenser's service life.
+  const known = Object.prototype.hasOwnProperty.call(SERVICE_LIFE, typeId);
+  const resolvedId = known ? typeId : 'generic_hvac';
+  const entry = SERVICE_LIFE[resolvedId];
   const median = entry.years;
   const rul = median - age;                 // can be negative (past median)
   const pct = Math.round((age / median) * 100);
@@ -213,7 +251,11 @@ export function assessCondition(year, typeId = 'generic_hvac') {
   return {
     age, median, rul, pct,
     priority,           // 'replace' | 'plan' | 'monitor' | 'ok'
-    typeId, typeLabel: entry.label,
+    typeId: resolvedId,
+    typeLabel: entry.label,
+    // null when the requested id was honoured; otherwise the unrecognized id
+    // that was asked for, available for the report to disclose.
+    typeFallback: known ? null : typeId,
     summary,
   };
 }

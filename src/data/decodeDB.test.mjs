@@ -3,7 +3,7 @@
 // Run:  node src/data/decodeDB.test.mjs
 import { DECODE_DB, DECODE_DB_VERSION } from './decodeDB.js';
 import {
-  decodeYearFromSerial, decodeCapacity, detectBrand,
+  decodeYearFromSerial, decodeCapacity, detectBrand, detectBrandInfo,
   detectBrandFromModel, decodeSerialCandidates, brandInfo, catalogStats,
   sanityCheckCapacity,
 } from './hvacDecode.js';
@@ -12,6 +12,21 @@ let pass = 0, fail = 0;
 const bad = [];
 const ok = (cond, label, got) => { cond ? pass++ : (fail++, bad.push(`FAIL  ${label}\n      got: ${JSON.stringify(got)}`)); };
 const rankOf = (c) => ({ high: 3, medium: 2, low: 1 }[c] || 0);
+
+// 0) Every rule must declare at least one example.
+//
+// Block 1 below iterates `examples`, so a rule declaring none contributes zero
+// assertions: it is untested, and the suite still reports green. Six rules sat
+// in that state — four of them the permissive `-loose` fallbacks, which are
+// precisely the rules able to fire on another manufacturer's serial and the
+// ones most in need of a pin. This makes the omission a red test rather than a
+// silence, so the next rule added cannot repeat it.
+for (const brand of DECODE_DB) {
+  for (const rule of brand.serialRules || []) {
+    ok((rule.examples || []).length > 0,
+      `${brand.name} [${rule.id}] declares at least one example`, rule.examples);
+  }
+}
 
 // 1) Every serial example declared in the DB.
 for (const brand of DECODE_DB) {
@@ -312,6 +327,35 @@ ok(detectBrand('YORKINTL unit', 'hvac') === 'York',
 // 17) NEW — alias-restructure regression: ABB is its own entry now, and
 // plain "abb" must not resolve to GE.
 ok(detectBrand('ABB switchgear', 'electrical') === 'ABB', 'ABB resolves to ABB, not GE', detectBrand('ABB switchgear', 'electrical'));
+
+// 17b) NEW — cross-family aliases are not borrowed across categories.
+//
+// "general electric" is claimed by GE (Electrical, family ABB) and by Rheem
+// (Water Heater), which sells GE-branded heaters. Both are 16 characters, so
+// the 5+ character cross-category gate passed them equally and catalog order
+// picked Rheem. A GE load centre photographed while the app was tagged for
+// anything other than electrical therefore reported Rheem — and Rheem has
+// serial rules where GE (Electrical) has none, so the panel also acquired a
+// manufacture year, an age, a remaining life, and a place on the replacement
+// schedule. Blank is the correct answer when the printed word cannot identify
+// the maker on its own.
+{
+  const gePanel = 'MODEL NO TQL21100\nGENERAL ELECTRIC\nSERIAL NO 0819ABC\n120/240V 200A';
+  ok(detectBrand(gePanel, 'electrical') === 'GE (Electrical)',
+    'GE panel in its own category resolves to GE', detectBrand(gePanel, 'electrical'));
+  ok(detectBrand(gePanel, 'waterheater') === 'Rheem (Water Heater)',
+    'GE in the water-heater category is a Rheem-built heater, in-category', detectBrand(gePanel, 'waterheater'));
+  for (const cat of ['hvac', 'vav', 'backflow']) {
+    ok(detectBrand(gePanel, cat) === null,
+      `GE panel is not borrowed into ${cat} on an alias two families claim`, detectBrand(gePanel, cat));
+  }
+  // The gate must not close on ordinary cross-category borrowing, which is
+  // load-bearing: water heaters live in mechanical rooms and get scanned
+  // under an HVAC tag constantly.
+  const bw = detectBrandInfo('MODEL M4TW50T\nBRADFORD WHITE\nSER MJ12345678', 'hvac');
+  ok(bw.name === 'Bradford White' && bw.outOfCategory === true,
+    'single-family alias still falls back across categories, and says so', bw);
+}
 
 
 // 15) Capacity/electrical cross-check.

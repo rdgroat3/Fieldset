@@ -462,6 +462,27 @@ const normalizeBrandText = (s) =>
 // ran the initials together.
 const squashBrandText = (s) => normalizeBrandText(s).replace(/\s/g, '');
 
+// Aliases claimed by entries belonging to different manufacturer families.
+// Derived from the catalog at load rather than hand-listed, so adding a brand
+// that collides with an existing one is caught without anyone remembering to
+// update a list. Same-family overlaps (Rheem hvac / Rheem waterheater, Bosch /
+// Buderus) are deliberate sibling entries and are not included.
+const CROSS_FAMILY_ALIASES = (() => {
+  const byAlias = new Map();
+  for (const b of DECODE_DB) {
+    for (const a of b.aliases) {
+      const k = normalizeBrandText(a);
+      if (!byAlias.has(k)) byAlias.set(k, new Set());
+      byAlias.get(k).add(b.family || b.name);
+    }
+  }
+  const out = new Set();
+  for (const [k, fams] of byAlias) if (fams.size > 1) out.add(k);
+  return out;
+})();
+
+const isCrossFamilyAlias = (alias) => CROSS_FAMILY_ALIASES.has(normalizeBrandText(alias));
+
 function brandsMatching(text, category, opts = {}) {
   if (!text) return [];
   const crossCategory = opts.crossCategory === true;
@@ -477,6 +498,7 @@ function brandsMatching(text, category, opts = {}) {
     }
     const outOfCategory = !!(category && b.category !== category);
     let bestLen = 0;
+    let bestAlias = null;
     let firstAt = Infinity;
     for (const a of b.aliases) {
       const aNorm = normalizeBrandText(a);
@@ -488,7 +510,7 @@ function brandsMatching(text, category, opts = {}) {
         ? (shortAliasHit(raw, a) || shortAliasHit(norm, aNorm))
         : (raw.includes(a) || norm.includes(aNorm) || (aSquash.length >= 5 && squash.includes(aSquash)));
       if (!hit) continue;
-      if (a.length > bestLen) bestLen = a.length;
+      if (a.length > bestLen) { bestLen = a.length; bestAlias = a; }
       const at = raw.indexOf(a) >= 0 ? raw.indexOf(a) : norm.indexOf(aNorm);
       if (at >= 0 && at < firstAt) firstAt = at;
     }
@@ -496,6 +518,20 @@ function brandsMatching(text, category, opts = {}) {
     // means an actual brand word is printed on the plate rather than a short
     // ambiguous token coincidentally matching.
     if (bestLen > 0 && outOfCategory && bestLen < 5) continue;
+    // …and the alias has to belong to one manufacturer. "general electric" is
+    // claimed by GE (Electrical, ABB-built) and by Rheem (Water Heater), which
+    // sells GE-branded heaters — both legitimate, both 16 characters, so the
+    // length gate above passes them equally and catalog order decides.
+    //
+    // In-category that is harmless: the selected category is the tiebreak, and
+    // it is the right one. Borrowing across categories it is not, because the
+    // two entries are not interchangeable downstream — Rheem carries serial
+    // rules and GE (Electrical) carries none, so a GE panel photographed while
+    // the app is tagged for water heaters does not merely get the wrong name,
+    // it gets a confident manufacture year off a water-heater serial rule, and
+    // from there an age, a remaining life, and a line on the replacement
+    // schedule. Leaving the brand blank costs the surveyor a typed word.
+    if (bestLen > 0 && outOfCategory && bestAlias && isCrossFamilyAlias(bestAlias)) continue;
     if (bestLen > 0) hits.push({ brand: b, matchLen: bestLen, firstAt, outOfCategory });
   }
 

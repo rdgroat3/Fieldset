@@ -331,7 +331,10 @@ export const DECODE_DB = [
       // rules whenever one of those matches.
       { id: 'trane-yyww-loose', test: /^(\d{2})(\d{2})/, map: { year2000: 1, week: 2 },
         confidence: 'low', note: 'YYWW assumed - serial length matches no known Trane style, confirm against the plate',
-        examples: [] },
+        // 7 chars: too short for trane-yyww-10 (10) and trane-ywwd-9 (9), so
+        // only the fallback can match. Pins the fallback's field order, which
+        // is the opposite of Carrier's WWYY on an identically shaped serial.
+        examples: [['1842XYZ', { year: 2018, week: 42 }]] },
     ],
   },
   {
@@ -411,7 +414,9 @@ export const DECODE_DB = [
       // pick — an honest low-confidence guess, not a false-high claim.
       { id: 'goodman-yymm-loose', test: /^(\d{2})(\d{2})/, map: { year2000: 1, monthNum: 2 },
         confidence: 'low', note: 'YYMM assumed - serial length matches no known modern Goodman style, confirm against the plate',
-        examples: [] },
+        // Letters after the date block: goodman-yymm requires 10 straight
+        // digits, so this reaches the fallback.
+        examples: [['1907AB123', { year: 2019, month: 7 }]] },
     ],
   },
   {
@@ -429,7 +434,10 @@ export const DECODE_DB = [
         confidence: 'high', note: 'month-letter + YY',
         examples: [['F181234567', { year: 2018, month: 6 }]] },
       { id: 'rheem-hvac-wwyy', test: /^[A-Z](\d{2})(\d{2})/i, map: { week: 1, yearShort: 2 },
-        confidence: 'low', note: 'older letter + week/year style', examples: [] },
+        confidence: 'low', note: 'older letter + week/year style',
+        // Leading W is outside rheem-hvac-myy's [A-M] month letters, so the
+        // older style is reached rather than shadowed by the month rule.
+        examples: [['W2517ABCDE', { year: 2017, week: 25 }]] },
     ],
   },
   {
@@ -806,7 +814,10 @@ export const DECODE_DB = [
         examples: [['0884810488', { year: 1984, month: 8 }], ['1291A39968', { year: 1991, month: 12 }]] },
       { id: 'rheem-wh-mmyy-loose', test: /^(\d{2})(\d{2})/, map: { monthNum: 1, yearShort: 2 },
         confidence: 'low', note: 'MMYY assumed - serial length matches no known modern Rheem style, confirm against the plate',
-        examples: [] },
+        // MMYY here vs YYWW on A.O. Smith's identically shaped fallback: the
+        // same four digits mean different things, which is the whole reason
+        // a mis-attributed brand produces a confident wrong year.
+        examples: [['0819ABC', { year: 2019, month: 8 }]] },
     ],
   },
   {
@@ -838,7 +849,7 @@ export const DECODE_DB = [
         examples: [['1512A00000', { year: 2015, week: 12 }], ['1220A00000', { year: 2012, week: 20 }]] },
       { id: 'aosmith-yyww-loose', test: /^(\d{2})(\d{2})/, map: { year2000: 1, week: 2 },
         confidence: 'low', note: 'YYWW assumed - serial length matches no known modern A.O. Smith style, confirm against the plate',
-        examples: [] },
+        examples: [['1533AB', { year: 2015, week: 33 }]] },
     ],
   },
   {
@@ -867,7 +878,7 @@ export const DECODE_DB = [
     serialRules: [
       { id: 'navien-yyyy', test: /\d{4}(20[0-3]\d)/, map: { yearFull: 1 },
         confidence: 'low', note: 'Navien embeds a 4-digit year mid-serial; position varies',
-        examples: [] },
+        examples: [['12342019ABC', { year: 2019 }]] },
     ],
   },
   {
