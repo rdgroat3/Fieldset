@@ -20,6 +20,19 @@ import { checkPhotoQuality } from '../utils/quality';
 
 const pad2 = (n) => String(n).padStart(2, '0');
 
+// Turn anything throwable into a non-empty, human-readable string, so a
+// burn failure can never report itself as a blank. An Error with an empty
+// message, or a bare string thrown from a native module, both used to
+// collapse to '' and suppress the detail line in the alert below — losing
+// the one fact needed to diagnose the failure, exactly when it mattered.
+const describeError = (e) => {
+  if (e == null) return `unknown (${e === null ? 'null' : 'undefined'} thrown)`;
+  const msg = (typeof e === 'string' ? e : e.message) || '';
+  const label = e.name || e.code || '';
+  const out = [label, msg].filter(Boolean).join(': ').trim();
+  return out || `unknown (${Object.prototype.toString.call(e)})`;
+};
+
 // Width in px of each edge bar drawn around the screen while flagging is on.
 // This was referenced by the flag-frame render below but never defined,
 // which threw a ReferenceError the instant the flag toggle was switched
@@ -395,6 +408,30 @@ export default function CameraScreen({ navigation, route }) {
   };
 
   /**
+   * Capture the freeze-frame composite (photo + stamp) to a temp file.
+   *
+   * Prefers ViewShot's own `capture()` over the free `captureRef(ref, opts)`
+   * helper. They are NOT equivalent: `capture()` awaits the component's
+   * first onLayout before capturing, while `captureRef` fires immediately
+   * against whatever the native view currently is. A capture that lands
+   * before layout sees a zero-sized view, and the iOS module rejects that
+   * outright ("The content size must not be zero or negative") — a
+   * deterministic failure, which is what "fails all three tries, every
+   * photo" actually looks like; a timing race would fail only sometimes.
+   * `capture()` also reads the `options` prop, so the burn settings live on
+   * the component in one place instead of being passed per call.
+   *
+   * captureRef stays as the fallback for the case where the ref resolved to
+   * a bare host node without the attached capture method.
+   */
+  const captureComposite = async () => {
+    const node = shotRef.current;
+    if (!node) throw new Error('ViewShot ref is null — burn composite is not mounted');
+    if (typeof node.capture === 'function') return node.capture();
+    return captureRef(node, { format: 'jpg', quality: 1 });
+  };
+
+  /**
    * Take, burn watermark, persist, addPhoto - all inline, no Review screen.
    * After saving, run the blur check; if blurry, offer Keep / Retake.
    */
@@ -454,12 +491,10 @@ export default function CameraScreen({ navigation, route }) {
       });
       await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
 
-      // quality: 1 — this composite is already downscaled to preview
-      // dimensions, so compressing it again on top of that was stacking two
-      // separate quality losses. Cheap to keep this step lossless.
-      const burnOpts = { format: 'jpg', quality: 1 };
       let appUri;
       let stampFailed = false;
+      let stampError = null;
+      const attemptErrors = [];
       // Three attempts, back-loaded with delay, before giving up — most
       // failures here are timing (the composite genuinely hadn't painted
       // yet), not permanent, so a beat between tries has a real chance of
@@ -467,8 +502,10 @@ export default function CameraScreen({ navigation, route }) {
       for (let attempt = 0; attempt < 3 && !appUri; attempt++) {
         if (attempt > 0) await new Promise((r) => setTimeout(r, 200 * attempt));
         try {
-          appUri = await persistToApp(await captureRef(shotRef, burnOpts), 'jpg');
+          appUri = await persistToApp(await captureComposite(), 'jpg');
         } catch (e) {
+          attemptErrors.push(`#${attempt + 1} ${describeError(e)}`);
+          console.warn(`[CameraScreen] burn attempt ${attempt + 1} failed:`, e);
           if (attempt === 2) {
             // All three tries failed. Falling back to the raw file keeps the
             // photo — losing it entirely would be worse — but a flagged
@@ -477,6 +514,7 @@ export default function CameraScreen({ navigation, route }) {
             // it as a small badge in Gallery/Finalize instead of only a
             // console.warn no one in the field will ever see.
             console.warn('[CameraScreen] watermark burn failed 3x, saving raw photo:', e);
+            stampError = attemptErrors.join('\n');
             appUri = await persistToApp(photo.uri, 'jpg');
             stampFailed = true;
           }
@@ -495,6 +533,7 @@ export default function CameraScreen({ navigation, route }) {
         Alert.alert(
           'Stamp didn\u2019t save',
           'This photo saved, but the watermark/flag banner failed to burn in after 3 tries. The flag is still recorded in the app \u2014 just not visible if you export or share this file directly.'
+            + (stampError ? `\n\nDetails:\n${stampError}` : '')
         );
       }
       maybeWarnBlurry(quality, photoId, appUri, assetId);
@@ -800,8 +839,20 @@ export default function CameraScreen({ navigation, route }) {
           capture requires the view to actually be on screen), which also serves
           as capture feedback. */}
       {pendingUri && (
-        <View style={styles.freeze} pointerEvents="none">
-          <ViewShot ref={shotRef} options={{ format: 'jpg', quality: 0.92 }} style={styles.freezeShot}>
+        // collapsable={false}: this wrapper has no visual styling of its own,
+        // so RN's view-flattening can strip it from the native tree entirely,
+        // which is a known cause of a capture failing to resolve a native view.
+        <View style={styles.freeze} pointerEvents="none" collapsable={false}>
+          {/* quality 1: this composite is already limited to preview pixel
+              dimensions, so re-compressing on top of that stacks a second
+              quality loss for nothing. 'tmpfile' (the default, stated here
+              explicitly) returns a file path, which is what persistToApp
+              copies from. */}
+          <ViewShot
+            ref={shotRef}
+            options={{ format: 'jpg', quality: 1, result: 'tmpfile' }}
+            style={styles.freezeShot}
+          >
             <Image
               source={{ uri: pendingUri }}
               style={StyleSheet.absoluteFill}
